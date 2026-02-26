@@ -1,0 +1,79 @@
+/* SlurmTerm — Textual CSS Layout */
+
+Screen {
+    background: $surface;
+}
+
+/* ---- Chrome ---- */
+
+Header {
+    dock: top;
+    background: $primary-background;
+}
+
+Footer {
+    dock: bottom;
+}
+
+/* ---- Tab container ---- */
+
+TabbedContent {
+    height: 1fr;
+}
+
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
+    height: 1fr;
+    padding: 0;
+}
+
+Underline > .underline--bar {
+    color: $accent;
+}
+
+/* ---- Shared status bar ---- */
+
+.status-bar {
+    height: 1;
+    dock: bottom;
+    background: $primary-background;
+    color: $text-muted;
+    padding: 0 2;
+}
+
+/* ---- DataTable shared ---- */
+
+.datatable--header {
+    background: $primary-background;
+    color: $text;
+    text-style: bold;
+}
+
+.datatable--cursor {
+    background: $accent;
+    color: $text;
+}
+
+.datatable--hover {
+    background: $surface-lighten-1;
+}
+
+/* ---- Composer ---- */
+
+#composer-grid {
+    padding: 1 2;
+}
+
+#composer-form {
+    scrollbar-size: 1 1;
+}
+
+#composer-preview {
+    background: $surface-darken-1;
+    padding: 1;
+}
+
+/* Confirm modal styles are defined in confirm.py DEFAULT_CSS */
