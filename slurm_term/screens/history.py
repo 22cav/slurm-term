@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.message import Message
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, Static, Select
 
 from slurm_term.slurm_api import SlurmController
 from slurm_term.utils.formatting import escape_markup, state_color
 
 _COLS = ("JobID", "Name", "Partition", "State", "Elapsed", "TotalCPU", "MaxRSS", "Exit")
+
+_TIME_WINDOWS = [
+    ("1 day", "now-1days"),
+    ("3 days", "now-3days"),
+    ("7 days", "now-7days"),
+    ("14 days", "now-14days"),
+    ("30 days", "now-30days"),
+]
 
 
 class HistoryTab(Vertical):
@@ -26,14 +35,27 @@ class HistoryTab(Vertical):
             super().__init__()
             self.job_id = job_id
 
+    class ResubmitRequested(Message):
+        """Posted when the user wants to resubmit a completed job."""
+
+        def __init__(self, job_id: str) -> None:
+            super().__init__()
+            self.job_id = job_id
+
     BINDINGS = [
         Binding("r", "refresh", "Refresh", show=True),
         Binding("i", "inspect_job", "Inspect", show=True),
+        Binding("s", "resubmit", "Resubmit", show=True),
     ]
 
     DEFAULT_CSS = """
     HistoryTab {
         height: 1fr;
+    }
+    #history-window-select {
+        dock: top;
+        width: 30;
+        margin: 0 1;
     }
     #history-table {
         height: 1fr;
@@ -45,13 +67,23 @@ class HistoryTab(Vertical):
         self,
         slurm: SlurmController | None = None,
         poll_interval: float = 60.0,
+        history_window: str = "now-7days",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.slurm = slurm or SlurmController()
         self.poll_interval = poll_interval
+        self._history_window = history_window
+        self._last_manual_refresh: float = 0.0
 
     def compose(self) -> ComposeResult:
+        options = [(label, value) for label, value in _TIME_WINDOWS]
+        yield Select(
+            options,
+            value=self._history_window,
+            id="history-window-select",
+            allow_blank=False,
+        )
         yield DataTable(id="history-table", cursor_type="row")
         yield Static("Loading job history…", id="history-status", classes="status-bar")
 
@@ -62,21 +94,35 @@ class HistoryTab(Vertical):
         self._poll()
         self.set_interval(self.poll_interval, self._poll)
 
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "history-window-select" and event.value:
+            self._history_window = str(event.value)
+            self._poll()
+
     def _poll(self) -> None:
         self.run_worker(self._fetch, exclusive=True, group="history-fetch")
 
     async def _fetch(self) -> None:
         loop = asyncio.get_running_loop()
         user = self.slurm.current_user()
+        window = self._history_window
         rows = await loop.run_in_executor(
-            None, lambda: self.slurm.get_sacct(user=user, start_time="now-7days"),
+            None, lambda: self.slurm.get_sacct(user=user, start_time=window),
         )
         self._update_table(rows)
+
+        # Find the human-readable label for the current window
+        label = window
+        for lbl, val in _TIME_WINDOWS:
+            if val == window:
+                label = lbl
+                break
+
         status = self.query_one("#history-status", Static)
         if not rows:
-            status.update(" No completed jobs found (last 7 days)")
+            status.update(f" No completed jobs found (last {label})")
         else:
-            status.update(f" {len(rows)} completed jobs (last 7 days)")
+            status.update(f" {len(rows)} completed jobs (last {label})")
 
     def _update_table(self, rows: list[dict[str, str]]) -> None:
         table = self.query_one("#history-table", DataTable)
@@ -112,6 +158,11 @@ class HistoryTab(Vertical):
         if job_id:
             self.post_message(self.InspectJobRequested(job_id))
 
+    def action_resubmit(self) -> None:
+        job_id = self._get_selected_job_id()
+        if job_id:
+            self.post_message(self.ResubmitRequested(job_id))
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter on a DataTable row — inspect the job."""
         job_id = self._get_selected_job_id()
@@ -119,4 +170,8 @@ class HistoryTab(Vertical):
             self.post_message(self.InspectJobRequested(job_id))
 
     def action_refresh(self) -> None:
+        now = time.monotonic()
+        if now - self._last_manual_refresh < 2.0:
+            return
+        self._last_manual_refresh = now
         self._poll()

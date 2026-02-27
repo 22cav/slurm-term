@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -53,6 +54,7 @@ class HardwareTab(Vertical):
         super().__init__(**kwargs)
         self.slurm = slurm or SlurmController()
         self.poll_interval = poll_interval
+        self._last_manual_refresh: float = 0.0
 
     def compose(self) -> ComposeResult:
         with TabbedContent(id="hw-tabs"):
@@ -122,4 +124,8 @@ class HardwareTab(Vertical):
             )
 
     def action_refresh(self) -> None:
+        now = time.monotonic()
+        if now - self._last_manual_refresh < 2.0:
+            return
+        self._last_manual_refresh = now
         self._poll()

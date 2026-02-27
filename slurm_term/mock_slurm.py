@@ -144,8 +144,10 @@ class MockSlurmController(SlurmController):
         job = self._spawn_job(state="PENDING")
         return job["id"]
 
-    def srun(self, cmd: list[str], params: dict[str, str] | None = None) -> int:
-        """Mock srun — prints a message and returns 0."""
+    def srun(
+        self, cmd: list[str], params: dict[str, str] | None = None
+    ) -> tuple[int, str]:
+        """Mock srun — prints a message and returns ``(0, "")``."""
         print(f"[demo] srun {' '.join(cmd)} (simulated, press Ctrl-D to return)")
         import sys
         try:
@@ -153,7 +155,7 @@ class MockSlurmController(SlurmController):
                 pass
         except (EOFError, KeyboardInterrupt):
             pass
-        return 0
+        return 0, ""
 
     def get_sinfo(self) -> list[dict[str, str]]:
         return [
@@ -268,10 +270,13 @@ class MockSlurmController(SlurmController):
 
         # Create a real log file
         log_path = os.path.join(self._tmpdir, f"slurm-{job_id}.out")
+        err_path = log_path.replace(".out", ".err")
         with open(log_path, "w") as f:
             f.write(f"=== SLURM Job {job_id} ===\n")
             f.write(f"Started at: {datetime.now().isoformat(timespec='seconds')}\n")
             f.write(f"Working directory: /home/matte/project\n\n")
+        with open(err_path, "w") as f:
+            f.write(f"=== SLURM Job {job_id} stderr ===\n")
 
         job = {
             "id": job_id,
@@ -367,6 +372,14 @@ class MockSlurmController(SlurmController):
                 f.write(line + "\n")
         except OSError:
             pass
+        # Write to stderr occasionally
+        if self._rng.random() < 0.1:
+            err_path = job["log_path"].replace(".out", ".err")
+            try:
+                with open(err_path, "a") as f:
+                    f.write(f"WARNING: {line}\n")
+            except OSError:
+                pass
 
     def _to_job_info(self, job: dict[str, Any]) -> JobInfo:
         elapsed = int(job.get("elapsed", 0))

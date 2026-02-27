@@ -13,6 +13,8 @@ import json
 import getpass
 import re
 import subprocess
+import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,17 +69,26 @@ class SlurmController:
     """Thin wrapper around Slurm CLI tools."""
 
     @staticmethod
-    def _run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(
+        cmd: list[str], *, check: bool = False, timeout: float = 30.0,
+    ) -> subprocess.CompletedProcess[str]:
         """Execute *cmd* via subprocess (never shell=True).
 
         The default ``check=False`` means failures never raise — callers
         should inspect ``result.returncode`` instead.
 
-        Returns a synthetic failed result if the binary is not found.
+        Returns a synthetic failed result if the binary is not found or
+        if the command times out (rc=124, matching GNU ``timeout``).
         """
         try:
             return subprocess.run(
                 cmd, capture_output=True, text=True, check=check,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=124, stdout="",
+                stderr=f"{cmd[0]}: timed out after {timeout}s",
             )
         except FileNotFoundError:
             return subprocess.CompletedProcess(
@@ -176,10 +187,15 @@ class SlurmController:
             return parts[-1]
         raise RuntimeError(f"Unexpected sbatch output: {result.stdout!r}")
 
-    def srun(self, cmd: list[str], params: dict[str, str] | None = None) -> int:
+    def srun(
+        self, cmd: list[str], params: dict[str, str] | None = None
+    ) -> tuple[int, str]:
         """Launch an interactive srun session (blocking, foreground).
 
-        Uses subprocess.run (no shell) for safety.
+        Uses ``subprocess.Popen`` (no shell) for safety.  stderr is piped
+        through a reader thread so it is both printed to the terminal in
+        real-time **and** captured.  Returns ``(returncode, stderr_text)``
+        so the caller can surface error details in the TUI.
         """
         srun_cmd: list[str] = ["srun"]
         if params:
@@ -194,8 +210,28 @@ class SlurmController:
         for arg in cmd:
             _validate_param_value(arg)
         srun_cmd.extend(cmd)
-        result = subprocess.run(srun_cmd)
-        return result.returncode
+
+        # Pipe stderr so we can capture it while still showing it in
+        # real-time via a reader thread.  stdin/stdout stay connected to
+        # the terminal for full interactive use.
+        stderr_chunks: list[str] = []
+
+        proc = subprocess.Popen(srun_cmd, stderr=subprocess.PIPE)
+
+        def _read_stderr() -> None:
+            assert proc.stderr is not None
+            for raw_line in proc.stderr:
+                decoded = raw_line.decode("utf-8", errors="replace")
+                stderr_chunks.append(decoded)
+                sys.stderr.write(decoded)
+                sys.stderr.flush()
+
+        reader = threading.Thread(target=_read_stderr, daemon=True)
+        reader.start()
+        proc.wait()
+        reader.join(timeout=2)
+
+        return proc.returncode, "".join(stderr_chunks).strip()
 
     # ----- cluster info ----------------------------------------------------
 
@@ -229,6 +265,10 @@ class SlurmController:
                 rows.append(row)
         return rows
 
+    # Regex to parse scontrol key=value pairs where values may contain spaces.
+    # Matches "Key=Value" where Value extends until the next "Word=" or end of line.
+    _SCONTROL_KV_RE = re.compile(r"(\w+)=(.*?)(?=\s+\w+=|$)")
+
     def get_node_info(self) -> list[dict[str, str]]:
         """Return per-node hardware details from ``scontrol show nodes``.
 
@@ -246,10 +286,8 @@ class SlurmController:
                     nodes.append(current)
                     current = {}
                 continue
-            for token in line.split():
-                if "=" in token:
-                    key, _, val = token.partition("=")
-                    current[key] = val
+            for match in self._SCONTROL_KV_RE.finditer(line):
+                current[match.group(1)] = match.group(2).strip()
         if current:
             nodes.append(current)
         return nodes
@@ -319,6 +357,34 @@ class SlurmController:
                         "max_vmsize": parts[2].strip(),
                     }
         return {}
+
+    # ----- GPU metrics -----------------------------------------------------
+
+    def get_gpu_utilization(self, node: str | None = None) -> list[float]:
+        """Query GPU utilization via nvidia-smi.
+
+        Returns a list of utilization percentages (one per GPU), or an
+        empty list on failure.  If *node* is given the command is run
+        via ``ssh`` on the target node.
+        """
+        base_cmd = [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        cmd = ["ssh", node] + base_cmd if node else base_cmd
+        result = self._run(cmd, timeout=10.0)
+        if result.returncode != 0:
+            return []
+        values: list[float] = []
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    values.append(float(line))
+                except ValueError:
+                    pass
+        return values
 
     # ----- parsing ---------------------------------------------------------
 

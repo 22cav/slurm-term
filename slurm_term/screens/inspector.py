@@ -7,12 +7,21 @@ import asyncio
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, Horizontal, VerticalScroll
+from textual.message import Message
 from textual.widgets import Static, RichLog, TabbedContent, TabPane, Label, ProgressBar
 from textual.timer import Timer
 from textual_plotext import PlotextPlot
 
 from slurm_term.slurm_api import SlurmController
 from slurm_term.utils.formatting import escape_markup, state_color
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from slurm_term.config import SlurmTermConfig
+
+# --- Tunables -----------------------------------------------------------
+METRICS_ROLLING_WINDOW = 60        # max data points kept per metric chart
+MEMORY_FALLBACK_MB = 64_000        # assumed total memory when not reported
 
 
 class _MetricChart(PlotextPlot):
@@ -122,8 +131,17 @@ def _parse_cpu_pct(cpu_str: str, elapsed_seconds: float = 0.0) -> float:
 class InspectorTab(Vertical):
     """Job inspector: visual metadata + live log viewer + real-time charts."""
 
+    class ResubmitRequested(Message):
+        """Posted when the user wants to resubmit the current job."""
+
+        def __init__(self, form_state: dict[str, str]) -> None:
+            super().__init__()
+            self.form_state = form_state
+
     BINDINGS = [
         Binding("escape", "back_to_monitor", "Back", show=True),
+        Binding("s", "resubmit", "Resubmit", show=True),
+        Binding("e", "toggle_log_stream", "Toggle stdout/stderr", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -228,16 +246,21 @@ class InspectorTab(Vertical):
         self,
         slurm: SlurmController | None = None,
         poll_interval: float = 3.0,
+        config: SlurmTermConfig | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.slurm = slurm or SlurmController()
         self.poll_interval = poll_interval
+        self._config = config
         self._current_job_id: str | None = None
         self._tailing: bool = False
         self._tail_gen: int = 0  # incremented on each new tail to stop stale workers
         self._mounted: bool = False
         self._pending_job_id: str | None = None
+        self._stdout_path: str = ""
+        self._stderr_path: str = ""
+        self._log_mode: str = "stdout"  # "stdout" or "stderr"
         self._poll_timer: Timer | None = None
         # Rolling metric histories for sstat-based polling
         self._cpu_history: list[float] = []
@@ -338,6 +361,70 @@ class InspectorTab(Vertical):
             self.app.action_switch_tab("monitor")
         except AttributeError:
             pass
+
+    def action_resubmit(self) -> None:
+        """Extract current job params and request resubmission via Composer."""
+        if not self._current_job_id:
+            return
+        details = self.slurm.get_job_details(self._current_job_id)
+        if not details:
+            self._set_status("Cannot fetch job details for resubmission")
+            return
+        form_state = self.extract_form_state(details)
+        self.post_message(self.ResubmitRequested(form_state))
+
+    @staticmethod
+    def extract_form_state(details: dict) -> dict[str, str]:
+        """Convert scontrol job details into a Composer form state dict."""
+        state: dict[str, str] = {"mode": "sbatch"}
+        state["name"] = str(details.get("name", ""))
+        state["partition"] = str(details.get("partition", ""))
+
+        # Time limit (minutes → HH:MM:SS)
+        tl = details.get("time_limit", 0)
+        if isinstance(tl, dict):
+            tl = int(tl.get("number", 0) or 0)
+        else:
+            tl = int(tl or 0)
+        if tl > 0:
+            h, rem = divmod(tl * 60, 3600)
+            m, s = divmod(rem, 60)
+            state["time"] = f"{h:02d}:{m:02d}:{s:02d}"
+
+        nodes = details.get("node_count", "")
+        if isinstance(nodes, dict):
+            nodes = nodes.get("number", "")
+        state["nodes"] = str(nodes) if nodes else "1"
+
+        ntasks = details.get("tasks_per_node", "")
+        if isinstance(ntasks, dict):
+            ntasks = ntasks.get("number", "")
+        state["ntasks"] = str(ntasks) if ntasks else ""
+
+        cpus = details.get("cpus_per_task", "")
+        if isinstance(cpus, dict):
+            cpus = cpus.get("number", "")
+        state["cpus"] = str(cpus) if cpus else ""
+
+        mem = details.get("minimum_memory_per_node", "")
+        if isinstance(mem, dict):
+            mem = mem.get("number", "")
+        if mem:
+            try:
+                gb = int(mem) / 1024
+                state["memory"] = f"{gb:.0f}G" if gb >= 1 else f"{mem}M"
+            except (ValueError, TypeError):
+                state["memory"] = str(mem)
+
+        gres = details.get("gres_detail", "")
+        if gres and str(gres) not in ("(null)", "", "[]"):
+            state["gpus"] = str(gres)
+
+        state["script"] = str(details.get("command", ""))
+        state["output"] = str(details.get("standard_output", ""))
+        state["error"] = str(details.get("standard_error", ""))
+
+        return state
 
     def _set_status(self, msg: str) -> None:
         self.query_one("#inspector-status", Static).update(f" {msg}")
@@ -508,20 +595,29 @@ class InspectorTab(Vertical):
 
         total_mem_mb = int(details.get("minimum_memory_per_node", 0) or 0)
         if total_mem_mb <= 0:
-            total_mem_mb = 64000  # fallback
+            total_mem_mb = MEMORY_FALLBACK_MB
 
         # AveCPU is a duration — compute % relative to wall-clock elapsed
         elapsed_sec = float(run_time) if run_time > 0 else 0.0
         cpu_val = _parse_cpu_pct(sstat.get("avg_cpu", ""), elapsed_sec)
         mem_val = _parse_rss_to_pct(sstat.get("max_rss", ""), total_mem_mb)
 
+        # GPU metrics: use nvidia-smi if enabled in config
+        gpu_val = 0.0
+        if (self._config and self._config.gpu_monitor_enabled
+                and "gpu" in str(details.get("gres_detail", "")).lower()):
+            node = str(details.get("nodes", "")) or None
+            gpu_vals = self.slurm.get_gpu_utilization(node=node)
+            if gpu_vals:
+                gpu_val = sum(gpu_vals) / len(gpu_vals)
+
         self._cpu_history.append(cpu_val)
         self._mem_history.append(mem_val)
-        self._gpu_history.append(0.0)  # sstat doesn't report GPU
+        self._gpu_history.append(gpu_val)
 
-        # Keep rolling window of 60 points
+        # Keep rolling window
         for hist in (self._cpu_history, self._mem_history, self._gpu_history):
-            while len(hist) > 60:
+            while len(hist) > METRICS_ROLLING_WINDOW:
                 hist.pop(0)
 
         for chart_id, data in [
@@ -535,7 +631,9 @@ class InspectorTab(Vertical):
                 pass
 
     def _start_log_tail(self, details: dict) -> None:
-        stdout_path = details.get("standard_output", "")
+        self._stdout_path = details.get("standard_output", "")
+        self._stderr_path = details.get("standard_error", "")
+        self._log_mode = "stdout"
         log_widget = self.query_one("#inspector-logs", RichLog)
         log_widget.clear()
 
@@ -543,14 +641,43 @@ class InspectorTab(Vertical):
         self._tail_gen += 1
         gen = self._tail_gen
 
-        if stdout_path:
-            log_widget.write(f"[dim]── Tailing: {escape_markup(stdout_path)} ──[/dim]\n")
+        path = self._stdout_path
+        if path:
+            log_widget.write(f"[dim]── Tailing stdout: {escape_markup(path)} ──[/dim]\n")
+            if self._stderr_path:
+                log_widget.write("[dim]Press [bold]e[/bold] to switch to stderr[/dim]\n")
             self.run_worker(
-                lambda: self._tail_file(stdout_path, gen),
+                lambda: self._tail_file(path, gen),
                 exclusive=True, group="log-tail", thread=True,
             )
         else:
             log_widget.write("[dim]No stdout file found for this job.[/dim]")
+
+    def action_toggle_log_stream(self) -> None:
+        """Switch between tailing stdout and stderr."""
+        if self._log_mode == "stdout" and self._stderr_path:
+            self._log_mode = "stderr"
+            path = self._stderr_path
+        elif self._log_mode == "stderr" and self._stdout_path:
+            self._log_mode = "stdout"
+            path = self._stdout_path
+        else:
+            return
+
+        log_widget = self.query_one("#inspector-logs", RichLog)
+        log_widget.clear()
+        self._tailing = False
+        self._tail_gen += 1
+        gen = self._tail_gen
+
+        other = "stderr" if self._log_mode == "stdout" else "stdout"
+        log_widget.write(f"[dim]── Tailing {self._log_mode}: {escape_markup(path)} ──[/dim]\n")
+        log_widget.write(f"[dim]Press [bold]e[/bold] to switch to {other}[/dim]\n")
+        self.run_worker(
+            lambda: self._tail_file(path, gen),
+            exclusive=True, group="log-tail", thread=True,
+        )
+        self._set_status(f"Viewing {self._log_mode}")
 
     # Max bytes to read on initial log load (1 MB)
     _MAX_INITIAL_READ = 1024 * 1024
@@ -563,7 +690,7 @@ class InspectorTab(Vertical):
         worker = get_current_worker()
         self._tailing = True
         try:
-            with open(path, "r") as f:
+            with open(path, "r", errors="replace") as f:
                 # For large files, seek to the last _MAX_INITIAL_READ bytes
                 try:
                     size = os.fstat(f.fileno()).st_size
@@ -581,7 +708,14 @@ class InspectorTab(Vertical):
                     self.app.call_from_thread(self._append_log, content)
 
                 while not worker.is_cancelled and self._tailing and self._tail_gen == gen:
-                    line = f.readline()
+                    try:
+                        line = f.readline()
+                    except OSError:
+                        self.app.call_from_thread(
+                            self._append_log,
+                            "[red]Log file became inaccessible[/red]\n",
+                        )
+                        break
                     if line:
                         self.app.call_from_thread(self._append_log, line)
                     else:

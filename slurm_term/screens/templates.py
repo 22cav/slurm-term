@@ -22,6 +22,11 @@ TEMPLATES_DIR = Path(os.environ.get(
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$")
 
 
+def _slug(name: str) -> str:
+    """Convert a template name to a valid CSS identifier."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
+
 def _sanitize_template_name(name: str) -> str:
     """Validate and return a safe template name, or raise ValueError."""
     name = name.strip()
@@ -184,22 +189,29 @@ class LoadTemplateScreen(ModalScreen[str | None]):
     }
     """
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # Maps slug → real template name for ID reverse-lookup
+        self._slug_map: dict[str, str] = {}
+
     def compose(self) -> ComposeResult:
         templates = list_templates()
+        self._slug_map = {_slug(n): n for n in templates}
         with Vertical(id="load-dialog"):
             yield Static("[b]Load Template[/b]", id="load-title", markup=True)
             with VerticalScroll(id="load-list"):
                 if not templates:
                     yield Static("[dim]No saved templates[/dim]", markup=True)
                 for name in templates:
+                    slug = _slug(name)
                     with Horizontal(classes="tmpl-row"):
                         yield Button(
                             name, variant="default",
-                            id=f"tmpl-{name}", classes="tmpl-name",
+                            id=f"tmpl-{slug}", classes="tmpl-name",
                         )
                         yield Button(
                             "X", variant="error",
-                            id=f"del-{name}",
+                            id=f"del-{slug}",
                             classes="tmpl-del",
                         )
             yield Button("Cancel", variant="default", id="btn-load-cancel")
@@ -210,10 +222,13 @@ class LoadTemplateScreen(ModalScreen[str | None]):
             self.dismiss(None)
             return
         if bid.startswith("tmpl-"):
-            self.dismiss(bid[5:])
+            slug = bid[5:]
+            name = self._slug_map.get(slug, slug)
+            self.dismiss(name)
             return
         if bid.startswith("del-"):
-            name = bid[4:]
+            slug = bid[4:]
+            name = self._slug_map.get(slug, slug)
             from slurm_term.screens.confirm import ConfirmScreen
             self.app.push_screen(
                 ConfirmScreen(f"Delete template [b]{name}[/b]?"),
@@ -230,18 +245,20 @@ class LoadTemplateScreen(ModalScreen[str | None]):
         scroll = self.query_one("#load-list", VerticalScroll)
         scroll.remove_children()
         templates = list_templates()
+        self._slug_map = {_slug(n): n for n in templates}
         if not templates:
             scroll.mount(Static("[dim]No saved templates[/dim]", markup=True))
         for name in templates:
+            slug = _slug(name)
             row = Horizontal(classes="tmpl-row")
             scroll.mount(row)
             row.mount(Button(
                 name, variant="default",
-                id=f"tmpl-{name}", classes="tmpl-name",
+                id=f"tmpl-{slug}", classes="tmpl-name",
             ))
             row.mount(Button(
                 "X", variant="error",
-                id=f"del-{name}",
+                id=f"del-{slug}",
                 classes="tmpl-del",
             ))
 

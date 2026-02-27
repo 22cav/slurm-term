@@ -21,6 +21,9 @@ from slurm_term.screens.param_catalog import FLAG_PARAMS
 
 _GPU_SPEC_RE = re.compile(r"^[a-zA-Z0-9_]*:?\d+$")
 
+# --- Tunables -----------------------------------------------------------
+PREVIEW_DEBOUNCE_SEC = 0.3         # delay before refreshing script preview
+
 
 class ComposerTab(Vertical):
     """Unified job submission form (sbatch + srun) with live preview."""
@@ -29,7 +32,7 @@ class ComposerTab(Vertical):
         Binding("ctrl+s", "submit", "Submit / Launch", show=True),
         Binding("ctrl+t", "save_template", "Save Template", show=True),
         Binding("ctrl+l", "load_template", "Load Template", show=True),
-
+        Binding("ctrl+y", "copy_preview", "Copy Script", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -125,6 +128,12 @@ class ComposerTab(Vertical):
     Input.-invalid {
         border: tall $error;
     }
+    .partition-summary {
+        color: $text-muted;
+        text-style: italic;
+        height: auto;
+        padding: 0 1;
+    }
     """
 
     def __init__(self, slurm: SlurmController | None = None, **kwargs) -> None:
@@ -134,6 +143,8 @@ class ComposerTab(Vertical):
         self._uid_to_key: dict[int, str] = {}
         self._uid_counter = count()
         self._preview_timer: Timer | None = None
+        self._sinfo_cache: list[dict[str, str]] = []
+        self._last_preview_text: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="composer-grid"):
@@ -150,6 +161,7 @@ class ComposerTab(Vertical):
 
                 yield self._label_row("Partition", "partition")
                 yield Select([], id="select-partition", prompt="Select partition")
+                yield Static("", id="partition-summary", classes="partition-summary")
 
                 yield self._label_row("Time Limit (HH:MM:SS)", "time")
                 yield Input(value="01:00:00", id="input-time")
@@ -233,11 +245,16 @@ class ComposerTab(Vertical):
 
     async def _fetch_partitions(self) -> None:
         loop = asyncio.get_running_loop()
-        parts = await loop.run_in_executor(None, self.slurm.get_partitions)
+        parts, sinfo = await asyncio.gather(
+            loop.run_in_executor(None, self.slurm.get_partitions),
+            loop.run_in_executor(None, self.slurm.get_sinfo),
+        )
+        self._sinfo_cache = sinfo or []
         if parts:
             sel = self.query_one("#select-partition", Select)
             sel.set_options([(p, p) for p in parts])
             sel.value = parts[0]
+            self._update_partition_summary()
 
     # ---- Mode toggle ------------------------------------------------------
 
@@ -267,6 +284,34 @@ class ComposerTab(Vertical):
 
     # ---- Event handlers ---------------------------------------------------
 
+    def _update_partition_summary(self) -> None:
+        """Show a one-line resource summary for the selected partition."""
+        part = self._sel("select-partition")
+        try:
+            summary = self.query_one("#partition-summary", Static)
+        except LookupError:
+            return
+        if not part or not self._sinfo_cache:
+            summary.update("")
+            return
+        rows = [r for r in self._sinfo_cache if r.get("partition") == part]
+        if not rows:
+            summary.update("")
+            return
+        total_nodes = sum(int(r.get("nodes", "0")) for r in rows)
+        cpus = rows[0].get("cpus", "?")
+        mem_mb = rows[0].get("memory", "0")
+        try:
+            mem_gb = f"{int(mem_mb) / 1024:.0f}"
+        except (ValueError, TypeError):
+            mem_gb = mem_mb
+        timelimit = rows[0].get("timelimit", "?")
+        gres = rows[0].get("gres", "(null)")
+        info = [f"{total_nodes} nodes", f"{cpus} CPUs/node", f"{mem_gb} GB", f"max {timelimit}"]
+        if gres and gres != "(null)":
+            info.append(gres)
+        summary.update(f"[dim]{' \u00b7 '.join(info)}[/dim]")
+
     def on_input_changed(self, event: Input.Changed) -> None:
         self._schedule_preview()
         self._validate_field(event.input)
@@ -274,6 +319,8 @@ class ComposerTab(Vertical):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "select-mode":
             self._update_mode_visibility()
+        if event.select.id == "select-partition":
+            self._update_partition_summary()
         self._schedule_preview()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -283,7 +330,7 @@ class ComposerTab(Vertical):
         """Debounce preview updates to avoid jank on rapid input."""
         if self._preview_timer is not None:
             self._preview_timer.stop()
-        self._preview_timer = self.set_timer(0.3, self._update_preview)
+        self._preview_timer = self.set_timer(PREVIEW_DEBOUNCE_SEC, self._update_preview)
 
     def _validate_field(self, widget: Input) -> None:
         """Inline validation — add/remove 'error' CSS class on the input."""
@@ -465,8 +512,10 @@ class ComposerTab(Vertical):
         }
         return state
 
-    def _set_form_state(self, state: dict[str, str]) -> None:
+    def set_form_state(self, state: dict[str, str]) -> None:
         """Restore form state from a saved dict."""
+        # Coerce all values to strings for safety (handles corrupted templates)
+        state = {k: str(v) if v is not None else "" for k, v in state.items()}
         field_map = {
             "time": "input-time", "nodes": "input-nodes",
             "ntasks": "input-ntasks", "cpus": "input-cpus",
@@ -493,15 +542,23 @@ class ComposerTab(Vertical):
 
         if "mode" in state:
             try:
-                self.query_one("#select-mode", Select).value = state["mode"]
+                sel = self.query_one("#select-mode", Select)
+                if state["mode"]:
+                    sel.value = state["mode"]
+                else:
+                    sel.clear()
                 self._update_mode_visibility()
-            except LookupError:
+            except (LookupError, Exception):
                 pass
 
         if "partition" in state:
             try:
-                self.query_one("#select-partition", Select).value = state["partition"]
-            except LookupError:
+                sel = self.query_one("#select-partition", Select)
+                if state["partition"]:
+                    sel.value = state["partition"]
+                else:
+                    sel.clear()
+            except (LookupError, Exception):
                 pass
 
         self._update_preview()
@@ -515,7 +572,7 @@ class ComposerTab(Vertical):
             return
         from slurm_term.screens.templates import save_template
         save_template(name, self._get_form_state())
-        self._set_status(f"Template '{name}' saved")
+        self.set_status(f"Template '{name}' saved")
 
     def action_load_template(self) -> None:
         from slurm_term.screens.templates import LoadTemplateScreen
@@ -526,11 +583,11 @@ class ComposerTab(Vertical):
             return
         from slurm_term.screens.templates import load_template
         data = load_template(name)
-        if data:
-            self._set_form_state(data)
-            self._set_status(f"Template '{name}' loaded")
+        if data and isinstance(data, dict):
+            self.set_form_state(data)
+            self.set_status(f"Template '{name}' loaded")
         else:
-            self._set_status(f"Template '{name}' not found")
+            self.set_status(f"Template '{name}' not found or invalid")
 
     # ---- Build params dict ------------------------------------------------
 
@@ -613,6 +670,7 @@ class ComposerTab(Vertical):
             lines.append("")
             lines.append(script)
         preview.write("\n".join(lines))
+        self._last_preview_text = "\n".join(lines)
 
     def _preview_srun(self, preview: RichLog) -> None:
         params = self._build_params()
@@ -625,10 +683,19 @@ class ComposerTab(Vertical):
         shell = os.environ.get("SHELL", "/bin/bash")
         parts.append(shell)
         preview.write(" \\\n  ".join(parts))
+        self._last_preview_text = " \\\n  ".join(parts)
+
+    def action_copy_preview(self) -> None:
+        """Copy the generated script to the system clipboard."""
+        if self._last_preview_text:
+            self.app.copy_to_clipboard(self._last_preview_text)
+            self.set_status("Script copied to clipboard")
+        else:
+            self.set_status("Nothing to copy")
 
     # ---- Validation -------------------------------------------------------
 
-    def _set_status(self, msg: str) -> None:
+    def set_status(self, msg: str) -> None:
         self.query_one("#composer-status", Static).update(f" {msg}")
 
     def _validate(self) -> str | None:
@@ -670,7 +737,7 @@ class ComposerTab(Vertical):
     def action_submit(self) -> None:
         error = self._validate()
         if error:
-            self._set_status(f"! {error}")
+            self.set_status(f"! {error}")
             return
 
         from slurm_term.screens.confirm import ConfirmScreen
@@ -694,7 +761,7 @@ class ComposerTab(Vertical):
             return
         params = self._build_params()
         script = self._val("input-script")
-        self._set_status("Submitting job...")
+        self.set_status("Submitting job...")
         self.run_worker(
             lambda: self._run_submit(script, params),
             group="job-submit", exclusive=True,
@@ -706,9 +773,9 @@ class ComposerTab(Vertical):
             job_id = await loop.run_in_executor(
                 None, self.slurm.submit_job, script, params,
             )
-            self._set_status(f"Submitted job {job_id}")
+            self.set_status(f"Submitted job {job_id}")
         except (RuntimeError, ValueError) as e:
-            self._set_status(f"! {e}")
+            self.set_status(f"! {e}")
 
     def _on_confirm_srun(self, confirmed: bool) -> None:
         if not confirmed:
@@ -717,14 +784,29 @@ class ComposerTab(Vertical):
         params["pty"] = ""
         shell = os.environ.get("SHELL", "/bin/bash")
 
-        self._set_status("Launching srun...")
+        self.set_status("Launching srun...")
         with self.app.suspend():
             print("\n--- SlurmTerm: Interactive srun Session ---")
             print("    Type 'exit' to return to SlurmTerm.\n")
-            rc = self.slurm.srun([shell], params=params)
+            rc, stderr_text = self.slurm.srun([shell], params=params)
             print(f"\nsrun exited with code {rc}")
-            print("Returning to SlurmTerm...\n")
-        self._set_status(f"srun session ended (exit code {rc})")
+            if rc != 0:
+                input("Press Enter to return to SlurmTerm...")
+            else:
+                print("Returning to SlurmTerm...\n")
+
+        if rc != 0 and stderr_text:
+            # Truncate for the notification toast (keep last few lines).
+            lines = stderr_text.strip().splitlines()
+            summary = "\n".join(lines[-5:]) if len(lines) > 5 else "\n".join(lines)
+            self.app.notify(
+                summary, title="srun failed", severity="error", timeout=12
+            )
+        self.set_status(
+            f"srun session ended (exit code {rc})"
+            if rc == 0
+            else f"srun failed (exit code {rc})"
+        )
 
 
 def _valid_gpu_spec(spec: str) -> bool:

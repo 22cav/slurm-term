@@ -456,3 +456,54 @@ class TestSafetyValidations:
         ctrl = SlurmController()
         with patch.object(ctrl, "_run", return_value=_mock_run(returncode=0)):
             assert ctrl.cancel_job("12345_1") is True
+
+
+# ---------------------------------------------------------------------------
+# Tests — _run timeout handling
+# ---------------------------------------------------------------------------
+
+class TestRunTimeout:
+    def test_timeout_returns_rc124(self):
+        with patch("slurm_term.slurm_api.subprocess.run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["squeue"], timeout=30)):
+            result = SlurmController._run(["squeue", "--json"])
+        assert result.returncode == 124
+        assert "timed out" in result.stderr
+
+    def test_file_not_found_still_returns_rc127(self):
+        with patch("slurm_term.slurm_api.subprocess.run",
+                    side_effect=FileNotFoundError):
+            result = SlurmController._run(["squeue", "--json"])
+        assert result.returncode == 127
+        assert "command not found" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Tests — get_node_info with values containing spaces
+# ---------------------------------------------------------------------------
+
+class TestGetNodeInfoSpaces:
+    def test_values_with_spaces(self):
+        ctrl = SlurmController()
+        output = "NodeName=node001 Reason=Not responding CPUTot=16\n"
+        with patch.object(ctrl, "_run", return_value=_mock_run(output)):
+            nodes = ctrl.get_node_info()
+        assert len(nodes) == 1
+        assert nodes[0]["Reason"] == "Not responding"
+        assert nodes[0]["CPUTot"] == "16"
+        assert nodes[0]["NodeName"] == "node001"
+
+    def test_multiline_node_with_spaces(self):
+        ctrl = SlurmController()
+        output = (
+            "NodeName=node001 CPUTot=16 State=IDLE\n"
+            "   Comment=Maintenance scheduled Reason=drain\n"
+            "\n"
+            "NodeName=node002 CPUTot=32 State=MIXED\n"
+        )
+        with patch.object(ctrl, "_run", return_value=_mock_run(output)):
+            nodes = ctrl.get_node_info()
+        assert len(nodes) == 2
+        assert nodes[0]["Comment"] == "Maintenance scheduled"
+        assert nodes[0]["Reason"] == "drain"
+        assert nodes[1]["NodeName"] == "node002"
