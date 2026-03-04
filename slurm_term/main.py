@@ -156,6 +156,14 @@ class SlurmTermApp(App):
                 severity="error",
             )
 
+    def on_composer_tab_job_submitted(
+        self, event: ComposerTab.JobSubmitted,
+    ) -> None:
+        """Auto-switch to Monitor tab after a successful submission."""
+        self.action_switch_tab("monitor")
+        if self._monitor:
+            self._monitor._poll()
+
 
 def run() -> None:
     """CLI entry point."""

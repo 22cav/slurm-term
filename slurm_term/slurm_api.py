@@ -187,6 +187,37 @@ class SlurmController:
             return parts[-1]
         raise RuntimeError(f"Unexpected sbatch output: {result.stdout!r}")
 
+    def submit_wrap(
+        self, commands: str, params: dict[str, str] | None = None,
+    ) -> str:
+        """Submit an inline job via ``sbatch --wrap``.  Returns the job ID.
+
+        This avoids needing a separate script file — the shell commands
+        are passed directly to sbatch.
+        """
+        cmd: list[str] = ["sbatch"]
+        if params:
+            for key, value in params.items():
+                if not _SAFE_KEY_RE.match(key):
+                    raise ValueError(f"Unsafe parameter key: {key!r}")
+                _validate_param_value(value)
+                if value:
+                    cmd.append(f"--{key}={value}")
+                else:
+                    cmd.append(f"--{key}")
+        cmd.append(f"--wrap={commands}")
+
+        result = self._run(cmd, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"sbatch --wrap failed (rc={result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+        parts = result.stdout.strip().split()
+        if parts:
+            return parts[-1]
+        raise RuntimeError(f"Unexpected sbatch output: {result.stdout!r}")
+
     def srun(
         self, cmd: list[str], params: dict[str, str] | None = None
     ) -> tuple[int, str]:
@@ -402,27 +433,32 @@ class SlurmController:
         state_raw = entry.get("job_state", "UNKNOWN")
         state = state_raw[0] if isinstance(state_raw, list) else str(state_raw)
 
+        # Node count: prefer node_count (numeric), fall back to nodes string
+        node_count_raw = entry.get("node_count")
+        if isinstance(node_count_raw, dict):
+            node_count = str(node_count_raw.get("number", ""))
+        else:
+            node_count = str(node_count_raw) if node_count_raw else ""
+
+        # Submit time: may be a dict with "number" key, a raw value, or absent
+        submit_time_raw = entry.get("submit_time")
+        if isinstance(submit_time_raw, dict):
+            submit_time = str(submit_time_raw.get("number", ""))
+        else:
+            submit_time = str(submit_time_raw) if submit_time_raw is not None else ""
+
         return JobInfo(
             job_id=str(entry.get("job_id", "")),
             name=str(entry.get("name", "")),
             partition=str(entry.get("partition", "")),
             state=state or "UNKNOWN",
             time_used=time_used,
-            nodes=str(
-                entry.get("nodes", "")
-                or (entry.get("node_count", {}).get("number", "")
-                    if isinstance(entry.get("node_count"), dict) else
-                    entry.get("node_count", ""))
-            ),
+            nodes=node_count or str(entry.get("nodes", "")),
             reason=str(entry.get("state_reason", "")),
             user=str(entry.get("user_name", "")),
             work_dir=str(entry.get("working_directory", "")),
             stdout_path=str(entry.get("standard_output", "")),
             stderr_path=str(entry.get("standard_error", "")),
-            submit_time=str(
-                entry.get("submit_time", {}).get("number", "")
-                if isinstance(entry.get("submit_time"), dict)
-                else entry.get("submit_time", "")
-            ),
+            submit_time=submit_time,
             node_list=str(entry.get("nodes", "")),
         )

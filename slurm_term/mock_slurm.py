@@ -75,7 +75,7 @@ class MockSlurmController(SlurmController):
     # -- overrides ----------------------------------------------------------
 
     @staticmethod
-    def _run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(cmd: list[str], *, check: bool = False, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     @staticmethod
@@ -141,6 +141,11 @@ class MockSlurmController(SlurmController):
         }
 
     def submit_job(self, script_path: str, params: dict[str, str] | None = None) -> str:
+        job = self._spawn_job(state="PENDING")
+        return job["id"]
+
+    def submit_wrap(self, commands: str, params: dict[str, str] | None = None) -> str:
+        """Mock submit_wrap — spawns a pending job like submit_job."""
         job = self._spawn_job(state="PENDING")
         return job["id"]
 

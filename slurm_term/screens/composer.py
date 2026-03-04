@@ -11,8 +11,9 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, Horizontal, VerticalScroll
 from textual.events import Click
+from textual.message import Message
 from textual.timer import Timer
-from textual.widgets import Static, Input, Select, Button, TextArea, RichLog, Label
+from textual.widgets import Static, Input, Select, Button, TextArea, RichLog, Label, Rule
 
 from slurm_term.slurm_api import SlurmController
 from slurm_term.utils.formatting import escape_markup
@@ -28,10 +29,18 @@ PREVIEW_DEBOUNCE_SEC = 0.3         # delay before refreshing script preview
 class ComposerTab(Vertical):
     """Unified job submission form (sbatch + srun) with live preview."""
 
+    class JobSubmitted(Message):
+        """Posted when a job is successfully submitted."""
+
+        def __init__(self, job_id: str) -> None:
+            super().__init__()
+            self.job_id = job_id
+
     BINDINGS = [
         Binding("ctrl+s", "submit", "Submit / Launch", show=True),
         Binding("ctrl+t", "save_template", "Save Template", show=True),
         Binding("ctrl+l", "load_template", "Load Template", show=True),
+        Binding("ctrl+i", "import_sbatch", "Import .sbatch", show=True),
         Binding("ctrl+y", "copy_preview", "Copy Script", show=True),
     ]
 
@@ -39,55 +48,123 @@ class ComposerTab(Vertical):
     ComposerTab {
         height: 1fr;
     }
+
+    /* ---- Grid layout ---- */
     #composer-grid {
         height: 1fr;
         layout: grid;
         grid-size: 2 1;
         grid-columns: 1fr 1fr;
-        grid-gutter: 1;
-        padding: 1;
+        grid-gutter: 0 2;
+        padding: 1 2;
     }
     #composer-form {
         height: 1fr;
-        padding: 0 1;
+        padding: 0;
     }
     #composer-preview-pane {
         height: 1fr;
     }
+    #preview-title {
+        text-style: bold;
+        color: $text;
+        background: $primary-background;
+        width: 100%;
+        height: 1;
+        padding: 0 1;
+    }
     #composer-preview {
         height: 1fr;
-        border: solid $accent;
+        border: solid $primary-background;
     }
 
-    /* Label row: text + clickable [?] on one line */
+    /* ---- Section titles ---- */
+    .section-title {
+        text-style: bold;
+        color: $accent;
+        width: 100%;
+        margin-top: 1;
+        margin-bottom: 0;
+    }
+    .section-title-first {
+        text-style: bold;
+        color: $accent;
+        width: 100%;
+        margin-bottom: 0;
+    }
+    .section-rule {
+        color: $primary-background;
+        margin-bottom: 0;
+    }
+
+    /* ---- Form field labels ---- */
     .form-label-row {
         height: 1;
         margin-top: 1;
     }
     .form-label-text {
         text-style: bold;
+        color: $text;
         width: 1fr;
     }
     .help-link {
         width: auto;
+        color: $text-muted;
+        text-style: none;
+    }
+    .help-link:hover {
         color: $accent;
-        text-style: bold;
     }
 
-    .form-section {
-        margin-top: 1;
-        text-style: bold italic;
-        color: $accent;
+    /* ---- Inputs ---- */
+    Input {
+        margin-bottom: 0;
     }
-    #btn-submit, #btn-add-param, #btn-save-tmpl, #btn-load-tmpl {
+    Input.-invalid {
+        border: tall $error;
+    }
+    .partition-summary {
+        color: $text-muted;
+        text-style: italic;
+        height: auto;
+        padding: 0 1;
+    }
+    #input-modules, #input-env {
+        height: 4;
+    }
+    #input-init {
+        height: 6;
+    }
+
+    /* ---- Button groups ---- */
+    .btn-group {
+        height: auto;
         margin-top: 1;
+    }
+    .btn-group Button {
+        width: 1fr;
+        margin: 0 1 0 0;
+    }
+    .btn-group Button:last-of-type {
+        margin: 0;
+    }
+    .btn-full {
         width: 100%;
+        margin-top: 1;
     }
+    #btn-submit {
+        width: 100%;
+        margin-top: 2;
+    }
+    #btn-add-param {
+        width: 100%;
+        margin-top: 1;
+    }
+
+    /* ---- Extra params ---- */
     #extras-container {
         height: auto;
     }
-
-    /* Extra param row: --key [?] [x]  then input below */
     .extra-row {
         height: auto;
     }
@@ -102,8 +179,7 @@ class ComposerTab(Vertical):
     }
     .extra-link {
         width: auto;
-        color: $accent;
-        text-style: bold;
+        color: $text-muted;
         margin: 0 1;
     }
     .extra-rm {
@@ -119,20 +195,11 @@ class ComposerTab(Vertical):
         text-style: italic;
     }
 
-    #input-modules, #input-env {
-        height: 4;
-    }
-    #input-init {
-        height: 6;
-    }
-    Input.-invalid {
-        border: tall $error;
-    }
-    .partition-summary {
-        color: $text-muted;
-        text-style: italic;
-        height: auto;
-        padding: 0 1;
+    /* ---- Hidden section marker ---- */
+    .form-section {
+        margin-top: 1;
+        text-style: bold italic;
+        color: $accent;
     }
     """
 
@@ -149,46 +216,48 @@ class ComposerTab(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal(id="composer-grid"):
             with VerticalScroll(id="composer-form"):
-                # ---- Mode ----
-                yield Label("Mode", classes="form-section")
+                # ── Mode ──
+                yield Static("Mode", classes="section-title-first")
                 yield Select(
                     [("sbatch (Batch Job)", "sbatch"), ("srun (Interactive)", "srun")],
                     value="sbatch", id="select-mode",
                 )
 
-                # ---- Core resource fields ----
-                yield Label("── Resources ──", classes="form-section")
+                # ── Resources ──
+                yield Rule(line_style="heavy", classes="section-rule")
+                yield Static("Resources", classes="section-title")
 
                 yield self._label_row("Partition", "partition")
                 yield Select([], id="select-partition", prompt="Select partition")
                 yield Static("", id="partition-summary", classes="partition-summary")
 
-                yield self._label_row("Time Limit (HH:MM:SS)", "time")
-                yield Input(value="01:00:00", id="input-time")
+                yield self._label_row("Time Limit", "time")
+                yield Input(value="01:00:00", placeholder="HH:MM:SS", id="input-time")
 
                 yield self._label_row("Nodes", "nodes")
                 yield Input(value="1", id="input-nodes")
 
-                yield self._label_row("Tasks per Node", "ntasks-per-node")
+                yield self._label_row("Tasks / Node", "ntasks-per-node")
                 yield Input(value="1", id="input-ntasks")
 
-                yield self._label_row("CPUs per Task", "cpus-per-task")
+                yield self._label_row("CPUs / Task", "cpus-per-task")
                 yield Input(value="1", id="input-cpus")
 
-                yield self._label_row("Memory (e.g. 4G)", "mem")
-                yield Input(value="4G", id="input-memory")
+                yield self._label_row("Memory", "mem")
+                yield Input(value="4G", placeholder="e.g. 4G, 512M", id="input-memory")
 
-                yield self._label_row("GPUs (e.g. 1 or a100:2)", "gres")
-                yield Input(id="input-gpus")
+                yield self._label_row("GPUs", "gres")
+                yield Input(placeholder="e.g. 1 or a100:2", id="input-gpus")
 
-                # ---- sbatch-only fields ----
-                yield Label("── Batch Job ──", classes="form-section", id="section-batch")
+                # ── Batch Job ──
+                yield Rule(line_style="heavy", id="rule-batch", classes="section-rule")
+                yield Static("Batch Job", classes="section-title", id="section-batch")
 
                 yield self._label_row("Job Name", "job-name", lbl_id="lbl-name")
                 yield Input(value="my_job", id="input-name")
 
                 yield self._label_row("Script Path", "_script-path", lbl_id="lbl-script")
-                yield Input(placeholder="/path/to/script.sh", id="input-script")
+                yield Input(placeholder="/path/to/script.sh (optional with init commands)", id="input-script")
 
                 yield self._label_row("Output Pattern", "output", lbl_id="lbl-output")
                 yield Input(value="%x-%j.out", id="input-output")
@@ -196,33 +265,39 @@ class ComposerTab(Vertical):
                 yield self._label_row("Error Pattern", "error", lbl_id="lbl-error")
                 yield Input(value="%x-%j.err", id="input-error")
 
-                # ---- Environment (sbatch only) ----
-                yield Label("── Environment ──", classes="form-section", id="section-env")
+                # ── Environment ──
+                yield Rule(line_style="heavy", id="rule-env", classes="section-rule")
+                yield Static("Environment", classes="section-title", id="section-env")
 
-                yield self._label_row("Module Loads (one per line)", "_modules", lbl_id="lbl-modules")
+                yield self._label_row("Module Loads", "_modules", lbl_id="lbl-modules")
                 yield TextArea(id="input-modules", language=None, soft_wrap=True)
 
-                yield self._label_row("Env Vars (KEY=VALUE)", "_env-vars", lbl_id="lbl-env")
+                yield self._label_row("Env Vars", "_env-vars", lbl_id="lbl-env")
                 yield TextArea(id="input-env", language=None, soft_wrap=True)
 
-                yield self._label_row("Init Commands (shell)", "_init-cmds", lbl_id="lbl-init")
+                yield self._label_row("Init Commands", "_init-cmds", lbl_id="lbl-init")
                 yield TextArea(id="input-init", language="bash", soft_wrap=True)
 
-                # ---- Dynamic extras ----
-                yield Label("── Additional Parameters ──", classes="form-section")
+                # ── Additional Parameters ──
+                yield Rule(line_style="heavy", classes="section-rule")
+                yield Static("Additional Parameters", classes="section-title")
                 yield Vertical(id="extras-container")
-                yield Button("+ Add Parameter...", variant="primary", id="btn-add-param")
+                yield Button("+ Add Parameter…", variant="primary", id="btn-add-param")
 
-                # ---- Templates ----
-                yield Label("── Templates ──", classes="form-section")
-                yield Button("Save as Template (Ctrl+T)", variant="primary", id="btn-save-tmpl")
-                yield Button("Load Template (Ctrl+L)", variant="default", id="btn-load-tmpl")
+                # ── Templates ──
+                yield Rule(line_style="heavy", classes="section-rule")
+                yield Static("Templates", classes="section-title")
+                with Horizontal(classes="btn-group"):
+                    yield Button("Save  (^T)", variant="primary", id="btn-save-tmpl")
+                    yield Button("Load  (^L)", variant="default", id="btn-load-tmpl")
+                    yield Button("Import .sbatch  (^I)", variant="default", id="btn-import-sbatch")
 
-                # ---- Submit ----
-                yield Button("Submit Job", variant="success", id="btn-submit")
+                # ── Submit ──
+                yield Button("Submit Job  (^S)", variant="success", id="btn-submit")
 
+            # ── Preview Pane ──────────────────────────────────
             with Vertical(id="composer-preview-pane"):
-                yield Label("Preview", classes="form-section")
+                yield Static("Script Preview", id="preview-title")
                 yield RichLog(id="composer-preview", wrap=True, highlight=True, markup=True)
 
         yield Static("Fill in the form and press Submit", id="composer-status", classes="status-bar")
@@ -235,7 +310,7 @@ class ComposerTab(Vertical):
             row_kwargs["id"] = lbl_id
         row = Horizontal(classes="form-label-row", **row_kwargs)
         row.compose_add_child(Static(text, classes="form-label-text"))
-        row.compose_add_child(Static("[?]", classes="help-link", id=f"help-{param_key}"))
+        row.compose_add_child(Static(" ?", classes="help-link", id=f"help-{param_key}"))
         return row
 
     def on_mount(self) -> None:
@@ -264,11 +339,11 @@ class ComposerTab(Vertical):
     def _update_mode_visibility(self) -> None:
         srun = self._is_srun()
         sbatch_ids = [
-            "section-batch", "lbl-name", "input-name",
+            "section-batch", "rule-batch", "lbl-name", "input-name",
             "lbl-script", "input-script",
             "lbl-output", "input-output",
             "lbl-error", "input-error",
-            "section-env", "lbl-modules", "input-modules",
+            "section-env", "rule-env", "lbl-modules", "input-modules",
             "lbl-env", "input-env", "lbl-init", "input-init",
         ]
         for wid in sbatch_ids:
@@ -278,7 +353,7 @@ class ComposerTab(Vertical):
                 pass
         try:
             btn = self.query_one("#btn-submit", Button)
-            btn.label = "Launch Interactive Session" if srun else "Submit Job"
+            btn.label = "Launch Interactive  (^S)" if srun else "Submit Job  (^S)"
         except LookupError:
             pass
 
@@ -419,6 +494,8 @@ class ComposerTab(Vertical):
             self.action_save_template()
         elif bid == "btn-load-tmpl":
             self.action_load_template()
+        elif bid == "btn-import-sbatch":
+            self.action_import_sbatch()
 
     def _show_help(self, param_key: str) -> None:
         from slurm_term.screens.add_param_screen import ParamHelpScreen
@@ -589,6 +666,51 @@ class ComposerTab(Vertical):
         else:
             self.set_status(f"Template '{name}' not found or invalid")
 
+    # ---- Import sbatch file -----------------------------------------------
+
+    def action_import_sbatch(self) -> None:
+        from slurm_term.screens.import_sbatch_screen import ImportSbatchScreen
+        self.app.push_screen(ImportSbatchScreen(), callback=self._on_import_sbatch)
+
+    def _on_import_sbatch(self, path: str | None) -> None:
+        if not path:
+            return
+        try:
+            from slurm_term.sbatch_parser import parse_sbatch_file
+            data = parse_sbatch_file(path)
+        except (FileNotFoundError, ValueError, OSError) as e:
+            self.set_status(f"! Import failed: {e}")
+            return
+        except Exception as e:
+            self.set_status(f"! Import failed unexpectedly: {e}")
+            return
+
+        # Apply the parsed state
+        self.set_form_state(data)
+
+        # Handle extra directives as additional params
+        extra = data.get("extra_directives", {})
+        if extra and isinstance(extra, dict):
+            for key, value in extra.items():
+                if not any(k == key for k, _, _, _ in self._extra_params):
+                    self._extra_params.append(
+                        (key, f"--{key}", value or "(imported)", ""),
+                    )
+            self._render_extras()
+            # Set values for extras
+            for key, value in extra.items():
+                if value:
+                    for uid, k in self._uid_to_key.items():
+                        if k == key:
+                            try:
+                                self.query_one(f"#ext-{uid}", Input).value = value
+                            except LookupError:
+                                pass
+
+        import os.path
+        basename = os.path.basename(path)
+        self.set_status(f"Imported '{basename}' — review and submit")
+
     # ---- Build params dict ------------------------------------------------
 
     def _build_params(self) -> dict[str, str]:
@@ -705,9 +827,11 @@ class ComposerTab(Vertical):
             except ValueError as e:
                 return str(e)
             script = self._val("input-script")
-            if not script:
-                return "Script path is required"
-            if not os.path.isfile(script):
+            init = self._txt("input-init")
+            # Either a script path or inline init commands are required
+            if not script and not init:
+                return "Provide a script path or init commands"
+            if script and not os.path.isfile(script):
                 return f"Script not found: {script}"
 
         t = self._val("input-time")
@@ -761,21 +885,62 @@ class ComposerTab(Vertical):
             return
         params = self._build_params()
         script = self._val("input-script")
+        init = self._txt("input-init")
+        modules = self._txt("input-modules")
+        env_vars = self._txt("input-env")
         self.set_status("Submitting job...")
         self.run_worker(
-            lambda: self._run_submit(script, params),
+            lambda: self._run_submit(script, params, init, modules, env_vars),
             group="job-submit", exclusive=True,
         )
 
-    async def _run_submit(self, script: str, params: dict[str, str]) -> None:
+    async def _run_submit(
+        self,
+        script: str,
+        params: dict[str, str],
+        init: str = "",
+        modules: str = "",
+        env_vars: str = "",
+    ) -> None:
         loop = asyncio.get_running_loop()
         try:
-            job_id = await loop.run_in_executor(
-                None, self.slurm.submit_job, script, params,
+            if script:
+                # Standard file-based submission
+                job_id = await loop.run_in_executor(
+                    None, self.slurm.submit_job, script, params,
+                )
+            else:
+                # Wrap-mode: build inline command string
+                wrap_lines: list[str] = []
+                if modules:
+                    for mod in modules.splitlines():
+                        mod = mod.strip()
+                        if mod:
+                            wrap_lines.append(f"module load {mod}")
+                if env_vars:
+                    for var in env_vars.splitlines():
+                        var = var.strip()
+                        if var:
+                            wrap_lines.append(f"export {var}")
+                if init:
+                    for cmd in init.splitlines():
+                        wrap_lines.append(cmd)
+                commands = "; ".join(wrap_lines)
+                job_id = await loop.run_in_executor(
+                    None, self.slurm.submit_wrap, commands, params,
+                )
+            self.set_status(f"✓ Job {job_id} submitted")
+            self.app.notify(
+                f"Job {job_id} submitted successfully",
+                title="Job Submitted",
+                severity="information",
+                timeout=6,
             )
-            self.set_status(f"Submitted job {job_id}")
-        except (RuntimeError, ValueError) as e:
+            self.post_message(self.JobSubmitted(job_id))
+        except (RuntimeError, ValueError, OSError) as e:
             self.set_status(f"! {e}")
+        except Exception as e:
+            self.set_status(f"! Unexpected error: {e}")
 
     def _on_confirm_srun(self, confirmed: bool) -> None:
         if not confirmed:
@@ -785,15 +950,22 @@ class ComposerTab(Vertical):
         shell = os.environ.get("SHELL", "/bin/bash")
 
         self.set_status("Launching srun...")
-        with self.app.suspend():
-            print("\n--- SlurmTerm: Interactive srun Session ---")
-            print("    Type 'exit' to return to SlurmTerm.\n")
-            rc, stderr_text = self.slurm.srun([shell], params=params)
-            print(f"\nsrun exited with code {rc}")
-            if rc != 0:
-                input("Press Enter to return to SlurmTerm...")
-            else:
-                print("Returning to SlurmTerm...\n")
+        try:
+            with self.app.suspend():
+                print("\n--- SlurmTerm: Interactive srun Session ---")
+                print("    Type 'exit' to return to SlurmTerm.\n")
+                rc, stderr_text = self.slurm.srun([shell], params=params)
+                print(f"\nsrun exited with code {rc}")
+                if rc != 0:
+                    input("Press Enter to return to SlurmTerm...")
+                else:
+                    print("Returning to SlurmTerm...\n")
+        except (ValueError, OSError) as e:
+            self.set_status(f"! srun launch failed: {e}")
+            return
+        except Exception as e:
+            self.set_status(f"! srun failed unexpectedly: {e}")
+            return
 
         if rc != 0 and stderr_text:
             # Truncate for the notification toast (keep last few lines).
@@ -802,11 +974,16 @@ class ComposerTab(Vertical):
             self.app.notify(
                 summary, title="srun failed", severity="error", timeout=12
             )
-        self.set_status(
-            f"srun session ended (exit code {rc})"
-            if rc == 0
-            else f"srun failed (exit code {rc})"
-        )
+        if rc == 0:
+            self.set_status("✓ Interactive session ended successfully")
+            self.app.notify(
+                "Interactive session completed",
+                title="srun Finished",
+                severity="information",
+                timeout=6,
+            )
+        else:
+            self.set_status(f"✗ srun failed (exit code {rc})")
 
 
 def _valid_gpu_spec(spec: str) -> bool:
