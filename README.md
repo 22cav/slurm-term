@@ -4,7 +4,7 @@ A keyboard-driven Terminal User Interface for the [Slurm](https://slurm.schedmd.
 
 Monitor jobs, compose batch scripts or interactive sessions, explore cluster hardware, and browse job history — all without leaving your terminal.
 
-> **v0.1.3**: Rewritten in Rust for instant startup, zero runtime dependencies, and a single static binary.
+> **v0.1.4**: Rewritten in Rust for instant startup, zero runtime dependencies, and a single static binary.
 
 ![Monitor](figs/monitor.png)
 ![Composer](figs/composer.png)

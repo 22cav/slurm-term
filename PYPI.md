@@ -4,7 +4,7 @@ A keyboard-driven Terminal User Interface for the [Slurm](https://slurm.schedmd.
 
 Monitor jobs, compose batch scripts or interactive sessions, explore cluster hardware, and browse job history — all without leaving your terminal.
 
-> **v0.1.3**: Rewritten in Rust for instant startup (~2 ms), zero Python dependencies, and a single static binary. Same `slurm-term` command, same feature set.
+> **v0.1.4**: Rewritten in Rust for instant startup (~2 ms), zero Python dependencies, and a single static binary. Same `slurm-term` command, same feature set.
 
 ## Installation
 
