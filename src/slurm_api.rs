@@ -135,11 +135,6 @@ pub trait SlurmController {
         script_path: &str,
         params: &HashMap<String, String>,
     ) -> Result<String, String>;
-    fn submit_wrap(
-        &self,
-        commands: &str,
-        params: &HashMap<String, String>,
-    ) -> Result<String, String>;
     fn get_sinfo(&self) -> Vec<SinfoRow>;
     fn get_node_info(&self) -> Vec<NodeInfoRow>;
     fn get_sacct(&self, user: Option<&str>, start_time: Option<&str>) -> Vec<SacctRow>;
@@ -288,38 +283,6 @@ impl SlurmController for RealSlurmController {
         let (rc, stdout, stderr) = Self::run_cmd(&refs, 30);
         if rc != 0 {
             return Err(format!("sbatch failed (rc={rc}): {}", stderr.trim()));
-        }
-        stdout
-            .split_whitespace()
-            .last()
-            .map(|s| s.to_string())
-            .ok_or_else(|| format!("Unexpected sbatch output: {stdout:?}"))
-    }
-
-    fn submit_wrap(
-        &self,
-        commands: &str,
-        params: &HashMap<String, String>,
-    ) -> Result<String, String> {
-        let mut args: Vec<String> = vec!["sbatch".to_string()];
-        for (key, value) in params {
-            validate_safe_key(key)?;
-            validate_param_value(value)?;
-            if value.is_empty() {
-                args.push(format!("--{key}"));
-            } else {
-                args.push(format!("--{key}={value}"));
-            }
-        }
-        args.push(format!("--wrap={commands}"));
-
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (rc, stdout, stderr) = Self::run_cmd(&refs, 30);
-        if rc != 0 {
-            return Err(format!(
-                "sbatch --wrap failed (rc={rc}): {}",
-                stderr.trim()
-            ));
         }
         stdout
             .split_whitespace()

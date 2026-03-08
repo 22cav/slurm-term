@@ -28,6 +28,8 @@ const GPU_DIRECTIVES: &[&str] = &["gres", "gpus", "gpus-per-node", "G"];
 
 /// Parse raw sbatch script text into a form state dict.
 pub fn parse_sbatch_text(text: &str) -> HashMap<String, String> {
+    // Normalize line endings: CRLF → LF, stray CR → LF
+    let text = &text.replace("\r\n", "\n").replace('\r', "\n");
     let dmap = directive_map();
 
     let long_re = Regex::new(r"^\s*#SBATCH\s+--([a-zA-Z][a-zA-Z0-9_-]*)(?:=|\s+)(.+)?$").unwrap();

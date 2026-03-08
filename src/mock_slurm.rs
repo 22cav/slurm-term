@@ -359,16 +359,6 @@ impl SlurmController for MockSlurmController {
         Ok(id)
     }
 
-    fn submit_wrap(
-        &self,
-        _commands: &str,
-        _params: &HashMap<String, String>,
-    ) -> Result<String, String> {
-        let mut inner = self.inner.borrow_mut();
-        let id = inner.spawn_job(Some("PENDING"));
-        Ok(id)
-    }
-
     fn get_sinfo(&self) -> Vec<SinfoRow> {
         vec![
             SinfoRow {

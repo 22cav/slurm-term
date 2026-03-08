@@ -20,7 +20,7 @@ impl Default for SlurmTermConfig {
     fn default() -> Self {
         Self {
             monitor_poll_interval: 3.0,
-            inspector_poll_interval: 3.0,
+            inspector_poll_interval: 1.0,
             hardware_poll_interval: 30.0,
             history_poll_interval: 60.0,
             subprocess_timeout: 30.0,

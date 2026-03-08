@@ -1,7 +1,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use ratatui::prelude::*;
@@ -92,13 +92,13 @@ impl App {
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
             let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
             original_hook(panic_info);
         }));
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -156,6 +156,7 @@ impl App {
 
         let tick_rate = Duration::from_millis(250);
         let mut last_poll = Instant::now();
+        let mut last_inspector_poll = Instant::now();
 
         loop {
             terminal.draw(|f| app.draw(f))?;
@@ -168,6 +169,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => app.handle_key(key),
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Paste(text) => app.handle_paste(&text),
                     _ => {}
                 }
             }
@@ -175,6 +177,20 @@ impl App {
             if last_poll.elapsed() >= Duration::from_secs_f64(app.poll_interval()) {
                 app.poll_active_tab();
                 last_poll = Instant::now();
+                last_inspector_poll = Instant::now();
+            }
+
+            // Fast inspector log refresh when following
+            if app.active_tab == TabId::Monitor {
+                if let Some(ref mut insp) = app.monitor.inspector {
+                    if insp.log_follow
+                        && last_inspector_poll.elapsed()
+                            >= Duration::from_secs_f64(app.config.inspector_poll_interval)
+                    {
+                        insp.load_log_tail();
+                        last_inspector_poll = Instant::now();
+                    }
+                }
             }
 
             if app.should_quit {
@@ -183,7 +199,7 @@ impl App {
         }
 
         terminal::disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
         Ok(())
     }
 
@@ -574,11 +590,25 @@ impl App {
                 let action = self.composer.handle_key(key, &*self.slurm);
                 match action {
                     composer::Action::None => {}
-                    composer::Action::Submit(params, script, wrap_cmd) => {
+                    composer::Action::Submit(params, script, body) => {
                         let result = if !script.is_empty() {
                             self.slurm.submit_job(&script, &params)
+                        } else if !body.is_empty() {
+                            // Write script body to temp file and submit
+                            let tmp = std::env::temp_dir().join(
+                                format!("slurm-term-{}.sh", std::process::id())
+                            );
+                            std::fs::write(&tmp, &body)
+                                .map_err(|e| format!("Failed to write temp script: {e}"))
+                                .and_then(|_| {
+                                    let r = self.slurm.submit_job(
+                                        &tmp.to_string_lossy(), &params
+                                    );
+                                    let _ = std::fs::remove_file(&tmp);
+                                    r
+                                })
                         } else {
-                            self.slurm.submit_wrap(&wrap_cmd, &params)
+                            Err("No script content to submit".into())
                         };
                         match result {
                             Ok(id) => {
@@ -630,6 +660,12 @@ impl App {
                     || self.composer.load_file_dialog.is_some()
             }
             _ => false,
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.active_tab == TabId::Composer {
+            self.composer.handle_paste(text);
         }
     }
 

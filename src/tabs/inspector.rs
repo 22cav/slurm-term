@@ -35,7 +35,7 @@ pub struct InspectorState {
     log_lines: Vec<String>,
     log_scroll: usize,
     log_mode: LogMode,
-    log_follow: bool,
+    pub log_follow: bool,
     // Metrics
     cpu_history: Vec<f64>,
     mem_history: Vec<f64>,
@@ -171,7 +171,7 @@ impl InspectorState {
         }
     }
 
-    fn load_log_tail(&mut self) {
+    pub fn load_log_tail(&mut self) {
         let path_key = match self.log_mode {
             LogMode::Stdout => "standard_output",
             LogMode::Stderr => "standard_error",

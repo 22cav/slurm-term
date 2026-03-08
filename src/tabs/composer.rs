@@ -97,6 +97,8 @@ pub struct ComposerState {
     preview_dirty: bool, // true = preview text was edited manually
     // Cursor position within the currently edited form field
     field_cursor: usize,
+    // Scroll offset for multiline form fields (line index of first visible line)
+    field_scroll: usize,
     // Extra parameters added via catalog
     pub extra_params: Vec<(String, String)>, // (sbatch_key, value)
     // Help overlay
@@ -148,6 +150,7 @@ impl ComposerState {
             preview_scroll: 0,
             preview_dirty: false,
             field_cursor: 0,
+            field_scroll: 0,
             extra_params: Vec::new(),
             help_overlay: false,
             add_param_dialog: None,
@@ -274,7 +277,7 @@ impl ComposerState {
     }
 
     fn build_wrap_commands(&self) -> String {
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<String> = vec!["#!/bin/bash".to_string()];
         let modules = self.fields.get("modules").cloned().unwrap_or_default();
         for m in modules.lines() {
             let m = m.trim();
@@ -293,7 +296,7 @@ impl ComposerState {
         for c in init.lines() {
             lines.push(c.to_string());
         }
-        lines.join("; ")
+        lines.join("\n")
     }
 
     fn validate(&self) -> Option<String> {
@@ -553,6 +556,11 @@ impl ComposerState {
             }
             let params = self.build_params();
             let script = self.get(Field::Script);
+            if script.is_empty() && !self.mode_is_srun {
+                // sbatch mode without script path: submit full generated script as temp file
+                let body = self.generate_preview();
+                return Action::Submit(params, String::new(), body);
+            }
             let wrap = self.build_wrap_commands();
             return Action::Submit(params, script, wrap);
         }
@@ -626,9 +634,11 @@ impl ComposerState {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.focus = (self.focus + 1) % total_fields;
+                    self.field_scroll = 0;
                 }
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
                     self.focus = if self.focus == 0 { total_fields.saturating_sub(1) } else { self.focus - 1 };
+                    self.field_scroll = 0;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if in_extra {
@@ -636,6 +646,7 @@ impl ComposerState {
                         if !param_catalog::lookup(&entry_key).is_some_and(|p| p.is_flag) {
                             self.editing = true;
                             self.field_cursor = self.extra_params[self.focus - vis.len()].1.len();
+                            self.field_scroll = 0;
                         }
                     } else {
                         match field {
@@ -663,6 +674,7 @@ impl ComposerState {
                             _ => {
                                 self.editing = true;
                                 self.field_cursor = self.get(field).len();
+                                self.field_scroll = 0;
                             }
                         }
                     }
@@ -741,11 +753,13 @@ impl ComposerState {
             KeyCode::Tab => {
                 self.editing = false;
                 self.focus = (self.focus + 1) % total_fields;
+                self.field_scroll = 0;
                 self.sync_preview_from_form();
             }
             KeyCode::BackTab => {
                 self.editing = false;
                 self.focus = if self.focus == 0 { total_fields.saturating_sub(1) } else { self.focus - 1 };
+                self.field_scroll = 0;
                 self.sync_preview_from_form();
             }
             _ => {
@@ -765,7 +779,7 @@ impl ComposerState {
                 self.field_cursor = self.field_cursor.min(new_val.len());
 
                 match key.code {
-                    KeyCode::Char(c) => {
+                    KeyCode::Char(c) if c != '\r' => {
                         new_val.insert(self.field_cursor, c);
                         self.field_cursor += c.len_utf8();
                     }
@@ -792,6 +806,7 @@ impl ComposerState {
                         } else {
                             self.editing = false;
                             self.focus = (self.focus + 1) % total_fields;
+                            self.field_scroll = 0;
                             self.sync_preview_from_form();
                             return Action::None;
                         }
@@ -852,6 +867,17 @@ impl ComposerState {
                     _ => {}
                 }
 
+                // Adjust scroll for multiline fields to keep cursor visible
+                if is_multiline {
+                    const MAX_VIS: usize = 8;
+                    let cursor_line = new_val[..self.field_cursor.min(new_val.len())].matches('\n').count();
+                    if cursor_line < self.field_scroll {
+                        self.field_scroll = cursor_line;
+                    } else if cursor_line >= self.field_scroll + MAX_VIS {
+                        self.field_scroll = cursor_line + 1 - MAX_VIS;
+                    }
+                }
+
                 // Write back
                 if in_extra {
                     let extra_idx = self.focus - vis.len();
@@ -863,6 +889,46 @@ impl ComposerState {
             }
         }
         Action::None
+    }
+
+    /// Handle pasted text (from bracketed paste mode).
+    /// Normalizes CRLF → LF and strips stray CR before inserting.
+    pub fn handle_paste(&mut self, text: &str) {
+        let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.active_pane == Pane::Preview && self.editing {
+            for c in clean.chars() {
+                if self.preview_cursor <= self.preview_text.len() {
+                    self.preview_text.insert(self.preview_cursor, c);
+                    self.preview_cursor += c.len_utf8();
+                }
+            }
+            self.preview_dirty = true;
+        } else if self.active_pane == Pane::Form && self.editing {
+            let vis = self.visible_fields();
+            if self.focus < vis.len() {
+                let field = vis[self.focus];
+                let key_name = Self::field_key(field);
+                let is_multiline = matches!(field, Field::Modules | Field::Env | Field::Init);
+                let mut val = self.fields.get(key_name).cloned().unwrap_or_default();
+                self.field_cursor = self.field_cursor.min(val.len());
+                for c in clean.chars() {
+                    if c == '\n' && !is_multiline {
+                        continue;
+                    }
+                    val.insert(self.field_cursor, c);
+                    self.field_cursor += c.len_utf8();
+                }
+                self.fields.insert(key_name.to_string(), val.clone());
+                // Adjust scroll for multiline fields
+                if is_multiline {
+                    const MAX_VIS: usize = 8;
+                    let cursor_line = val[..self.field_cursor.min(val.len())].matches('\n').count();
+                    if cursor_line >= self.field_scroll + MAX_VIS {
+                        self.field_scroll = cursor_line + 1 - MAX_VIS;
+                    }
+                }
+            }
+        }
     }
 
     fn handle_key_preview(&mut self, key: KeyEvent) -> Action {
@@ -904,7 +970,7 @@ impl ComposerState {
                     self.sync_form_from_preview();
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if c != '\r' => {
                 if self.preview_cursor <= self.preview_text.len() {
                     self.preview_text.insert(self.preview_cursor, c);
                     self.preview_cursor += c.len_utf8();
@@ -1172,18 +1238,43 @@ impl ComposerState {
                     }
                 }
                 Field::Modules | Field::Env | Field::Init => {
-                    let line_count = val.lines().count().max(if val.ends_with('\n') { val.lines().count() + 1 } else { val.lines().count() });
-                    let line_count = line_count.max(1);
-                    if is_editing {
-                        let cursor_pos = self.field_cursor.min(val.len());
-                        let mut display_val = val.clone();
-                        display_val.insert(cursor_pos, '\u{2588}');
-                        let display_val = display_val.replace('\n', "\n ");
-                        let row_h = display_val.lines().count().max(1) as u16;
-                        (format!(" {display_val}"), row_h)
-                    } else if is_focused && line_count > 1 {
-                        let display_val = val.replace('\n', "\n ");
-                        (format!(" {display_val}"), line_count as u16)
+                    const MAX_VIS: usize = 8;
+                    let line_count = if val.is_empty() { 1 } else {
+                        val.lines().count() + if val.ends_with('\n') { 1 } else { 0 }
+                    }.max(1);
+                    if is_editing || (is_focused && line_count > 1) {
+                        let vis_lines: Vec<&str> = if is_editing {
+                            let cursor_pos = self.field_cursor.min(val.len());
+                            // Determine which line the cursor is on
+                            let cursor_line = val[..cursor_pos].matches('\n').count();
+                            // Auto-scroll: handled via self.field_scroll
+                            // (adjusted in key handler, but clamp here too)
+                            let _ = cursor_line; // scroll already set
+                            val.lines().collect()
+                        } else {
+                            val.lines().collect()
+                        };
+                        let scroll = self.field_scroll.min(vis_lines.len().saturating_sub(1));
+                        let end = (scroll + MAX_VIS).min(vis_lines.len());
+                        let window: Vec<&str> = vis_lines[scroll..end].to_vec();
+                        let row_h = window.len().max(1) as u16;
+                        let display_val = if is_editing {
+                            // Rebuild with cursor block in the visible window
+                            let cursor_pos = self.field_cursor.min(val.len());
+                            let mut full = val.clone();
+                            full.insert(cursor_pos, '\u{2588}');
+                            let all_lines: Vec<&str> = full.lines().collect();
+                            let end2 = (scroll + MAX_VIS).min(all_lines.len());
+                            all_lines[scroll..end2].join("\n ")
+                        } else {
+                            window.join("\n ")
+                        };
+                        let scroll_hint = if line_count > MAX_VIS {
+                            format!(" [{}/{} lines]", scroll + 1, line_count)
+                        } else {
+                            String::new()
+                        };
+                        (format!(" {display_val}{scroll_hint}"), row_h)
                     } else if line_count > 1 {
                         let first_line = val.lines().next().unwrap_or("");
                         (format!("{first_line} (+{} lines)", line_count - 1), 1)

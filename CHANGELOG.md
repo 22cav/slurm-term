@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5]
+
+### Fixed
+- **Fixed script submission breaking shell control structures**: jobs with `for`/`do`/`done` loops, line continuations, or multiline init commands no longer fail with syntax errors. Submission now writes a proper temp script file instead of collapsing everything into `sbatch --wrap` with `; ` joins.
+- **Fixed CRLF line endings in submitted scripts**: `\r\n` line endings from pasted text or loaded files are now normalized to `\n` at all entry points (file loading, clipboard paste, parser).
+- **Fixed multiline form fields disappearing**: Init Cmds, Modules, and Env Vars fields with many lines no longer overflow and vanish when focused. The display is now capped at 8 visible lines with scroll tracking and a line-count indicator.
+
+### Added
+- **Bracketed paste support**: pasting text into the Composer (both form fields and preview editor) now uses terminal bracketed paste mode, correctly handling multiline pastes with proper `\r` filtering.
+
+### Changed
+- **Faster log following**: Inspector log file refresh now runs on a separate 1-second timer (down from 3s) when follow mode is active, for near-real-time output tailing.
+- Removed the `sbatch --wrap` submission path; all submissions now go through script files.
+
 ## [0.1.4]
 
 ### Fixed
