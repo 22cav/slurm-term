@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
@@ -105,8 +106,18 @@ pub struct ComposerState {
     pub help_overlay: bool,
     // Add parameter dialog
     pub add_param_dialog: Option<AddParamDialog>,
-    // Load .sbatch file dialog
-    pub load_file_dialog: Option<String>,
+    // File browser dialog
+    pub file_browser: Option<FileBrowserDialog>,
+    // Multiline field editor: takes over the right pane for Modules/Env/Init
+    field_editor: Option<FieldEditor>,
+}
+
+/// State for editing a multiline field in the right pane with full editor features.
+struct FieldEditor {
+    field: Field,
+    text: String,
+    cursor: usize,
+    scroll: usize,
 }
 
 pub struct AddParamDialog {
@@ -117,6 +128,141 @@ pub struct AddParamDialog {
 pub enum TemplateDialog {
     Save { name: String },
     Load { names: Vec<String>, selected: usize },
+}
+
+// ---------------------------------------------------------------------------
+// File browser dialog
+// ---------------------------------------------------------------------------
+
+const SCRIPT_EXTENSIONS: &[&str] = &["sbatch", "sh", "job"];
+
+struct FileEntry {
+    name: String,
+    is_dir: bool,
+    is_compatible: bool,
+}
+
+pub struct FileBrowserDialog {
+    current_dir: PathBuf,
+    entries: Vec<FileEntry>,
+    selected: usize,
+    scroll: usize,
+    error: Option<String>,
+}
+
+impl FileBrowserDialog {
+    fn new() -> Self {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut fb = Self {
+            current_dir: dir,
+            entries: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            error: None,
+        };
+        fb.refresh_entries();
+        fb
+    }
+
+    fn refresh_entries(&mut self) {
+        self.entries.clear();
+        self.error = None;
+
+        let read_dir = match std::fs::read_dir(&self.current_dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.error = Some(format!("Cannot read directory: {e}"));
+                return;
+            }
+        };
+
+        let mut dirs: Vec<FileEntry> = Vec::new();
+        let mut files: Vec<FileEntry> = Vec::new();
+
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip hidden files
+            }
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if is_dir {
+                dirs.push(FileEntry { name, is_dir: true, is_compatible: false });
+            } else {
+                let has_ext = SCRIPT_EXTENSIONS.iter().any(|ext| {
+                    name.ends_with(&format!(".{ext}"))
+                });
+                if has_ext {
+                    let compatible = check_script_compatible(&entry.path());
+                    files.push(FileEntry { name, is_dir: false, is_compatible: compatible });
+                }
+                // non-matching extensions are not shown at all
+            }
+        }
+
+        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        self.entries = dirs;
+        self.entries.extend(files);
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.entries.get(self.selected).map(|e| self.current_dir.join(&e.name))
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent() {
+            self.current_dir = parent.to_path_buf();
+            self.refresh_entries();
+        }
+    }
+
+    fn enter_selected(&mut self) {
+        if let Some(entry) = self.entries.get(self.selected) {
+            if entry.is_dir {
+                self.current_dir = self.current_dir.join(&entry.name);
+                self.refresh_entries();
+            }
+        }
+    }
+}
+
+/// Check if a script file looks compatible: first 32 lines must contain
+/// a shebang (`#!/...`) or at least one `#SBATCH` directive.
+fn check_script_compatible(path: &std::path::Path) -> bool {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut found_shebang = false;
+    let mut found_sbatch = false;
+    for (i, line) in reader.lines().enumerate() {
+        if i >= 32 { break; }
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return false, // binary file or encoding error
+        };
+        let trimmed = line.trim();
+        if i == 0 && trimmed.starts_with("#!") {
+            found_shebang = true;
+        }
+        if trimmed.starts_with("#SBATCH") {
+            found_sbatch = true;
+            break;
+        }
+    }
+    found_shebang || found_sbatch
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
 }
 
 impl ComposerState {
@@ -154,7 +300,8 @@ impl ComposerState {
             extra_params: Vec::new(),
             help_overlay: false,
             add_param_dialog: None,
-            load_file_dialog: None,
+            file_browser: None,
+            field_editor: None,
         }
     }
 
@@ -401,33 +548,83 @@ impl ComposerState {
             return Action::None;
         }
 
-        // Load file dialog
-        if let Some(ref mut path) = self.load_file_dialog {
+        // File browser dialog
+        if let Some(ref mut fb) = self.file_browser {
             match key.code {
                 KeyCode::Esc => {
-                    self.load_file_dialog = None;
+                    self.file_browser = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if fb.selected + 1 < fb.entries.len() {
+                        fb.selected += 1;
+                        // Keep selection visible
+                        let visible_h = 20_usize; // approximate
+                        if fb.selected >= fb.scroll + visible_h {
+                            fb.scroll = fb.selected + 1 - visible_h;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    fb.selected = fb.selected.saturating_sub(1);
+                    if fb.selected < fb.scroll {
+                        fb.scroll = fb.selected;
+                    }
+                }
+                KeyCode::Left | KeyCode::Backspace => {
+                    fb.go_up();
+                }
+                KeyCode::Right => {
+                    // Enter directory on Right arrow
+                    if fb.entries.get(fb.selected).is_some_and(|e| e.is_dir) {
+                        fb.enter_selected();
+                    }
                 }
                 KeyCode::Enter => {
-                    let p = path.clone();
-                    self.load_file_dialog = None;
-                    if p.is_empty() {
-                        return Action::Status("No file path provided".into());
-                    }
-                    match sbatch_parser::parse_sbatch_file(&p) {
-                        Ok(state) => {
-                            self.set_form_state(&state);
-                            return Action::Status(format!("Loaded {p}"));
+                    if let Some(entry) = fb.entries.get(fb.selected) {
+                        if entry.is_dir {
+                            fb.enter_selected();
+                        } else if entry.is_compatible {
+                            let path = fb.selected_path().unwrap();
+                            let path_str = path.to_string_lossy().to_string();
+                            self.file_browser = None;
+                            match sbatch_parser::parse_sbatch_file(&path_str) {
+                                Ok(state) => {
+                                    self.set_form_state(&state);
+                                    // Auto-switch to preview pane in edit mode
+                                    self.active_pane = Pane::Preview;
+                                    self.editing = true;
+                                    self.preview_cursor = self.preview_text.len();
+                                    self.preview_scroll = 0;
+                                    return Action::Status(format!("Loaded {path_str}"));
+                                }
+                                Err(e) => {
+                                    return Action::Status(format!("! {e}"));
+                                }
+                            }
                         }
-                        Err(e) => {
-                            return Action::Status(format!("! {e}"));
-                        }
+                        // incompatible files: do nothing on Enter
                     }
                 }
-                KeyCode::Backspace => { path.pop(); }
-                KeyCode::Char(c) => { path.push(c); }
+                KeyCode::Char('~') => {
+                    // Go to home directory
+                    if let Some(home) = dirs_home() {
+                        fb.current_dir = home;
+                        fb.refresh_entries();
+                    }
+                }
+                KeyCode::Char('.') => {
+                    // Toggle showing hidden files: re-scan including dot-files
+                    // For now, just refresh
+                    fb.refresh_entries();
+                }
                 _ => {}
             }
             return Action::None;
+        }
+
+        // Multiline field editor (right pane)
+        if self.field_editor.is_some() {
+            return self.handle_key_field_editor(key);
         }
 
         // Add parameter dialog
@@ -589,9 +786,9 @@ impl ComposerState {
             return Action::None;
         }
 
-        // Ctrl+O: load .sbatch file
+        // Ctrl+O: open file browser
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            self.load_file_dialog = Some(String::new());
+            self.file_browser = Some(FileBrowserDialog::new());
             return Action::None;
         }
 
@@ -670,6 +867,18 @@ impl ComposerState {
                                     self.set(Field::Partition, self.partitions[new_idx].clone());
                                     self.sync_preview_from_form();
                                 }
+                            }
+                            // Multiline fields open in the right-pane editor
+                            Field::Modules | Field::Env | Field::Init => {
+                                let text = self.get(field);
+                                let cursor = text.len();
+                                self.field_editor = Some(FieldEditor {
+                                    field,
+                                    text,
+                                    cursor,
+                                    scroll: 0,
+                                });
+                                self.editing = true;
                             }
                             _ => {
                                 self.editing = true;
@@ -961,16 +1170,143 @@ impl ComposerState {
             return Action::None;
         }
 
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
         // Editing mode in preview - direct text editing
         match key.code {
             KeyCode::Esc => {
                 self.editing = false;
-                // Sync changes back to form
                 if self.preview_dirty {
                     self.sync_form_from_preview();
                 }
             }
-            KeyCode::Char(c) if c != '\r' => {
+
+            // Ctrl+K: delete from cursor to end of line
+            KeyCode::Char('k') if ctrl => {
+                let after = &self.preview_text[self.preview_cursor..];
+                let eol = after.find('\n').unwrap_or(after.len());
+                if eol == 0 && self.preview_cursor < self.preview_text.len() {
+                    // Cursor at newline: delete the newline itself
+                    self.preview_text.remove(self.preview_cursor);
+                } else {
+                    self.preview_text.replace_range(self.preview_cursor..self.preview_cursor + eol, "");
+                }
+                self.preview_dirty = true;
+            }
+
+            // Ctrl+U: delete from cursor to start of line
+            KeyCode::Char('u') if ctrl => {
+                let before = &self.preview_text[..self.preview_cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                self.preview_text.replace_range(sol..self.preview_cursor, "");
+                self.preview_cursor = sol;
+                self.preview_dirty = true;
+            }
+
+            // Ctrl+D: delete entire current line
+            KeyCode::Char('d') if ctrl => {
+                let before = &self.preview_text[..self.preview_cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let after = &self.preview_text[self.preview_cursor..];
+                let eol = after.find('\n').map(|i| self.preview_cursor + i + 1)
+                    .unwrap_or(self.preview_text.len());
+                // If deleting last line and there's a preceding newline, remove it too
+                let start = if sol > 0 && eol == self.preview_text.len() { sol - 1 } else { sol };
+                self.preview_text.replace_range(start..eol, "");
+                self.preview_cursor = start.min(self.preview_text.len());
+                self.preview_dirty = true;
+            }
+
+            // Ctrl+Backspace / Ctrl+W: delete previous word
+            KeyCode::Backspace if ctrl => {
+                if self.preview_cursor > 0 {
+                    let before = &self.preview_text[..self.preview_cursor];
+                    let trimmed = before.trim_end();
+                    let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '-')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    self.preview_text.replace_range(word_start..self.preview_cursor, "");
+                    self.preview_cursor = word_start;
+                    self.preview_dirty = true;
+                }
+            }
+            KeyCode::Char('w') if ctrl => {
+                // Same as Ctrl+Backspace
+                if self.preview_cursor > 0 {
+                    let before = &self.preview_text[..self.preview_cursor];
+                    let trimmed = before.trim_end();
+                    let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '-')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    self.preview_text.replace_range(word_start..self.preview_cursor, "");
+                    self.preview_cursor = word_start;
+                    self.preview_dirty = true;
+                }
+            }
+
+            // Ctrl+Left: move to previous word boundary
+            KeyCode::Left if ctrl => {
+                if self.preview_cursor > 0 {
+                    let before = &self.preview_text[..self.preview_cursor];
+                    let trimmed_len = before.trim_end().len();
+                    let search_in = &self.preview_text[..trimmed_len];
+                    self.preview_cursor = search_in
+                        .rfind(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '=')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                }
+            }
+
+            // Ctrl+Right: move to next word boundary
+            KeyCode::Right if ctrl => {
+                if self.preview_cursor < self.preview_text.len() {
+                    let after = &self.preview_text[self.preview_cursor..];
+                    // Skip current word chars, then skip whitespace
+                    let skip_word = after
+                        .find(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '=')
+                        .unwrap_or(after.len());
+                    let rest = &after[skip_word..];
+                    let skip_space = rest
+                        .find(|c: char| !c.is_whitespace())
+                        .unwrap_or(rest.len());
+                    self.preview_cursor += skip_word + skip_space;
+                }
+            }
+
+            // Ctrl+A: move to start of line (like shell)
+            KeyCode::Char('a') if ctrl => {
+                let before = &self.preview_text[..self.preview_cursor];
+                self.preview_cursor = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            }
+
+            // Ctrl+E: move to end of line (like shell)
+            KeyCode::Char('e') if ctrl => {
+                let after = &self.preview_text[self.preview_cursor..];
+                self.preview_cursor += after.find('\n').unwrap_or(after.len());
+            }
+
+            KeyCode::Tab => {
+                // Insert 4 spaces for indentation
+                let indent = "    ";
+                self.preview_text.insert_str(self.preview_cursor, indent);
+                self.preview_cursor += indent.len();
+                self.preview_dirty = true;
+            }
+
+            KeyCode::BackTab => {
+                // Remove up to 4 leading spaces on current line
+                let before = &self.preview_text[..self.preview_cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_start = &self.preview_text[sol..];
+                let spaces = line_start.chars().take(4).take_while(|c| *c == ' ').count();
+                if spaces > 0 {
+                    self.preview_text.replace_range(sol..sol + spaces, "");
+                    self.preview_cursor = self.preview_cursor.saturating_sub(spaces);
+                    self.preview_dirty = true;
+                }
+            }
+
+            KeyCode::Char(c) if c != '\r' && !ctrl => {
                 if self.preview_cursor <= self.preview_text.len() {
                     self.preview_text.insert(self.preview_cursor, c);
                     self.preview_cursor += c.len_utf8();
@@ -979,7 +1315,6 @@ impl ComposerState {
             }
             KeyCode::Backspace => {
                 if self.preview_cursor > 0 {
-                    // Find previous char boundary
                     let prev = self.preview_text[..self.preview_cursor]
                         .char_indices()
                         .last()
@@ -997,8 +1332,14 @@ impl ComposerState {
                 }
             }
             KeyCode::Enter => {
-                self.preview_text.insert(self.preview_cursor, '\n');
-                self.preview_cursor += 1;
+                // Auto-indent: copy leading whitespace from current line
+                let before = &self.preview_text[..self.preview_cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let current_line = &self.preview_text[sol..];
+                let indent: String = current_line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                let insert = format!("\n{indent}");
+                self.preview_text.insert_str(self.preview_cursor, &insert);
+                self.preview_cursor += insert.len();
                 self.preview_dirty = true;
             }
             KeyCode::Left => {
@@ -1020,17 +1361,14 @@ impl ComposerState {
                 }
             }
             KeyCode::Home => {
-                // Move to start of current line
                 let before = &self.preview_text[..self.preview_cursor];
                 self.preview_cursor = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
             }
             KeyCode::End => {
-                // Move to end of current line
                 let after = &self.preview_text[self.preview_cursor..];
                 self.preview_cursor += after.find('\n').unwrap_or(after.len());
             }
             KeyCode::Up => {
-                // Move cursor up one line
                 let before = &self.preview_text[..self.preview_cursor];
                 let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
                 let col = self.preview_cursor - cur_line_start;
@@ -1044,7 +1382,6 @@ impl ComposerState {
                 }
             }
             KeyCode::Down => {
-                // Move cursor down one line
                 let before = &self.preview_text[..self.preview_cursor];
                 let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
                 let col = self.preview_cursor - cur_line_start;
@@ -1061,6 +1398,180 @@ impl ComposerState {
         Action::None
     }
 
+    /// Handle keys when the multiline field editor is active.
+    /// Reuses the same editing logic as the preview editor.
+    fn handle_key_field_editor(&mut self, key: KeyEvent) -> Action {
+        let fe = self.field_editor.as_mut().unwrap();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc => {
+                // Save back to field and close editor
+                let field = fe.field;
+                let text = fe.text.clone();
+                self.set(field, text);
+                self.field_editor = None;
+                self.editing = false;
+                self.sync_preview_from_form();
+            }
+            KeyCode::Char('k') if ctrl => {
+                let after = &fe.text[fe.cursor..];
+                let eol = after.find('\n').unwrap_or(after.len());
+                if eol == 0 && fe.cursor < fe.text.len() {
+                    fe.text.remove(fe.cursor);
+                } else {
+                    fe.text.replace_range(fe.cursor..fe.cursor + eol, "");
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                let before = &fe.text[..fe.cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                fe.text.replace_range(sol..fe.cursor, "");
+                fe.cursor = sol;
+            }
+            KeyCode::Char('d') if ctrl => {
+                let before = &fe.text[..fe.cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let after = &fe.text[fe.cursor..];
+                let eol = after.find('\n').map(|i| fe.cursor + i + 1).unwrap_or(fe.text.len());
+                let start = if sol > 0 && eol == fe.text.len() { sol - 1 } else { sol };
+                fe.text.replace_range(start..eol, "");
+                fe.cursor = start.min(fe.text.len());
+            }
+            KeyCode::Backspace if ctrl => {
+                if fe.cursor > 0 {
+                    let before = &fe.text[..fe.cursor];
+                    let trimmed = before.trim_end();
+                    let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '-')
+                        .map(|i| i + 1).unwrap_or(0);
+                    fe.text.replace_range(word_start..fe.cursor, "");
+                    fe.cursor = word_start;
+                }
+            }
+            KeyCode::Char('w') if ctrl => {
+                if fe.cursor > 0 {
+                    let before = &fe.text[..fe.cursor];
+                    let trimmed = before.trim_end();
+                    let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '-')
+                        .map(|i| i + 1).unwrap_or(0);
+                    fe.text.replace_range(word_start..fe.cursor, "");
+                    fe.cursor = word_start;
+                }
+            }
+            KeyCode::Left if ctrl => {
+                if fe.cursor > 0 {
+                    let before = &fe.text[..fe.cursor];
+                    let trimmed_len = before.trim_end().len();
+                    let search_in = &fe.text[..trimmed_len];
+                    fe.cursor = search_in
+                        .rfind(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '=')
+                        .map(|i| i + 1).unwrap_or(0);
+                }
+            }
+            KeyCode::Right if ctrl => {
+                if fe.cursor < fe.text.len() {
+                    let after = &fe.text[fe.cursor..];
+                    let skip_word = after.find(|c: char| c.is_whitespace() || c == '/' || c == '-' || c == '=')
+                        .unwrap_or(after.len());
+                    let rest = &after[skip_word..];
+                    let skip_space = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
+                    fe.cursor += skip_word + skip_space;
+                }
+            }
+            KeyCode::Char('a') if ctrl => {
+                let before = &fe.text[..fe.cursor];
+                fe.cursor = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            }
+            KeyCode::Char('e') if ctrl => {
+                let after = &fe.text[fe.cursor..];
+                fe.cursor += after.find('\n').unwrap_or(after.len());
+            }
+            KeyCode::Tab => {
+                fe.text.insert_str(fe.cursor, "    ");
+                fe.cursor += 4;
+            }
+            KeyCode::BackTab => {
+                let before = &fe.text[..fe.cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_start = &fe.text[sol..];
+                let spaces = line_start.chars().take(4).take_while(|c| *c == ' ').count();
+                if spaces > 0 {
+                    fe.text.replace_range(sol..sol + spaces, "");
+                    fe.cursor = fe.cursor.saturating_sub(spaces);
+                }
+            }
+            KeyCode::Char(c) if c != '\r' && !ctrl => {
+                if fe.cursor <= fe.text.len() {
+                    fe.text.insert(fe.cursor, c);
+                    fe.cursor += c.len_utf8();
+                }
+            }
+            KeyCode::Backspace => {
+                if fe.cursor > 0 {
+                    let prev = fe.text[..fe.cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                    fe.text.remove(prev);
+                    fe.cursor = prev;
+                }
+            }
+            KeyCode::Delete => {
+                if fe.cursor < fe.text.len() {
+                    fe.text.remove(fe.cursor);
+                }
+            }
+            KeyCode::Enter => {
+                let before = &fe.text[..fe.cursor];
+                let sol = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let current_line = &fe.text[sol..];
+                let indent: String = current_line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                let insert = format!("\n{indent}");
+                fe.text.insert_str(fe.cursor, &insert);
+                fe.cursor += insert.len();
+            }
+            KeyCode::Left => {
+                if fe.cursor > 0 {
+                    fe.cursor = fe.text[..fe.cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                }
+            }
+            KeyCode::Right => {
+                if fe.cursor < fe.text.len() {
+                    fe.cursor += fe.text[fe.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                }
+            }
+            KeyCode::Home => {
+                let before = &fe.text[..fe.cursor];
+                fe.cursor = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            }
+            KeyCode::End => {
+                let after = &fe.text[fe.cursor..];
+                fe.cursor += after.find('\n').unwrap_or(after.len());
+            }
+            KeyCode::Up => {
+                let before = &fe.text[..fe.cursor];
+                let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let col = fe.cursor - cur_line_start;
+                if cur_line_start > 0 {
+                    let prev_line_start = fe.text[..cur_line_start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let prev_line_len = cur_line_start - 1 - prev_line_start;
+                    fe.cursor = prev_line_start + col.min(prev_line_len);
+                }
+            }
+            KeyCode::Down => {
+                let before = &fe.text[..fe.cursor];
+                let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let col = fe.cursor - cur_line_start;
+                let after = &fe.text[fe.cursor..];
+                if let Some(nl) = after.find('\n') {
+                    let next_line_start = fe.cursor + nl + 1;
+                    let next_after = &fe.text[next_line_start..];
+                    let next_line_len = next_after.find('\n').unwrap_or(next_after.len());
+                    fe.cursor = next_line_start + col.min(next_line_len);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     pub fn draw(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -1068,7 +1579,13 @@ impl ComposerState {
             .split(area);
 
         self.draw_form(f, chunks[0]);
-        self.draw_preview(f, chunks[1]);
+
+        // Right pane: field editor takes priority over preview
+        if let Some(ref fe) = self.field_editor {
+            self.draw_field_editor(f, chunks[1], fe);
+        } else {
+            self.draw_preview(f, chunks[1]);
+        }
 
         // Template dialog overlay
         if let Some(ref dialog) = self.template_dialog {
@@ -1139,9 +1656,9 @@ impl ComposerState {
             self.draw_add_param_dialog(f, f.area(), dialog);
         }
 
-        // Load file dialog
-        if let Some(ref path) = self.load_file_dialog {
-            self.draw_load_file_dialog(f, f.area(), path);
+        // File browser dialog
+        if let Some(ref fb) = self.file_browser {
+            self.draw_file_browser(f, f.area(), fb);
         }
     }
 
@@ -1171,7 +1688,7 @@ impl ComposerState {
 
         let mut rows: Vec<Row> = Vec::new();
         for (i, &field) in vis.iter().enumerate() {
-            let is_focused = i == self.focus;
+            let is_focused = is_active && i == self.focus;
             let is_editing = is_focused && self.editing;
 
             let indicator = if is_editing {
@@ -1238,50 +1755,30 @@ impl ComposerState {
                     }
                 }
                 Field::Modules | Field::Env | Field::Init => {
-                    const MAX_VIS: usize = 8;
-                    let line_count = if val.is_empty() { 1 } else {
-                        val.lines().count() + if val.ends_with('\n') { 1 } else { 0 }
-                    }.max(1);
-                    if is_editing || (is_focused && line_count > 1) {
-                        let vis_lines: Vec<&str> = if is_editing {
-                            let cursor_pos = self.field_cursor.min(val.len());
-                            // Determine which line the cursor is on
-                            let cursor_line = val[..cursor_pos].matches('\n').count();
-                            // Auto-scroll: handled via self.field_scroll
-                            // (adjusted in key handler, but clamp here too)
-                            let _ = cursor_line; // scroll already set
-                            val.lines().collect()
-                        } else {
-                            val.lines().collect()
-                        };
-                        let scroll = self.field_scroll.min(vis_lines.len().saturating_sub(1));
-                        let end = (scroll + MAX_VIS).min(vis_lines.len());
-                        let window: Vec<&str> = vis_lines[scroll..end].to_vec();
-                        let row_h = window.len().max(1) as u16;
-                        let display_val = if is_editing {
-                            // Rebuild with cursor block in the visible window
-                            let cursor_pos = self.field_cursor.min(val.len());
-                            let mut full = val.clone();
-                            full.insert(cursor_pos, '\u{2588}');
-                            let all_lines: Vec<&str> = full.lines().collect();
-                            let end2 = (scroll + MAX_VIS).min(all_lines.len());
-                            all_lines[scroll..end2].join("\n ")
-                        } else {
-                            window.join("\n ")
-                        };
-                        let scroll_hint = if line_count > MAX_VIS {
-                            format!(" [{}/{} lines]", scroll + 1, line_count)
-                        } else {
-                            String::new()
-                        };
-                        (format!(" {display_val}{scroll_hint}"), row_h)
-                    } else if line_count > 1 {
-                        let first_line = val.lines().next().unwrap_or("");
-                        (format!("{first_line} (+{} lines)", line_count - 1), 1)
-                    } else if val.is_empty() && !is_editing {
-                        ("\u{2014}".to_string(), 1)
+                    // Multiline fields: show a clean summary, Enter opens right-pane editor
+                    if val.is_empty() {
+                        let hint = if is_focused { "Enter to edit" } else { "\u{2014}" };
+                        (hint.to_string(), 1)
                     } else {
-                        (val.clone(), 1)
+                        let items: Vec<&str> = val.lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect();
+                        let count = items.len();
+                        let label = match field {
+                            Field::Modules => if count == 1 { "module" } else { "modules" },
+                            Field::Env => if count == 1 { "var" } else { "vars" },
+                            Field::Init => if count == 1 { "cmd" } else { "cmds" },
+                            _ => unreachable!(),
+                        };
+                        // Show up to 3 items inline, comma-separated
+                        let shown: Vec<&str> = items.iter().take(3).copied().collect();
+                        let summary = shown.join(", ");
+                        if count > 3 {
+                            (format!("{summary} (+{} {label})", count - 3), 1)
+                        } else {
+                            (format!("{summary}  [{count} {label}]"), 1)
+                        }
                     }
                 }
                 _ => {
@@ -1335,7 +1832,7 @@ impl ComposerState {
         }
         for (ei, (key, value)) in self.extra_params.iter().enumerate() {
             let extra_focus_idx = vis.len() + ei;
-            let is_focused = extra_focus_idx == self.focus;
+            let is_focused = is_active && extra_focus_idx == self.focus;
             let is_editing = is_focused && self.editing;
 
             let indicator = if is_editing {
@@ -1409,9 +1906,9 @@ impl ComposerState {
         };
 
         let title = if is_editing {
-            " Preview [editing] "
+            " Editor [editing] "
         } else if self.preview_dirty {
-            " Preview [modified] "
+            " Editor [modified] "
         } else {
             " Preview "
         };
@@ -1434,8 +1931,11 @@ impl ComposerState {
         };
 
         if is_editing {
-            // Show text with cursor indicator
+            // Show text with cursor indicator and line numbers
             let lines: Vec<&str> = text.split('\n').collect();
+            let total_lines = lines.len();
+            let gutter_width = if total_lines >= 100 { 5_u16 } else { 4 };
+
             // Find cursor position in terms of line/col
             let mut chars_counted = 0;
             let mut cursor_line = 0;
@@ -1463,13 +1963,39 @@ impl ComposerState {
             let end = (scroll + visible_height).min(lines.len());
             let visible_lines = &lines[scroll..end];
 
+            // Split inner area into gutter + code
+            let editor_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(gutter_width), Constraint::Min(0)])
+                .split(inner);
+
+            // Render line numbers in gutter
+            let gutter_lines: Vec<Line> = visible_lines
+                .iter()
+                .enumerate()
+                .map(|(vi, _)| {
+                    let line_num = scroll + vi + 1;
+                    let is_cursor = scroll + vi == cursor_line;
+                    let style = if is_cursor {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED)
+                    };
+                    Line::from(Span::styled(
+                        format!("{:>width$} ", line_num, width = (gutter_width - 1) as usize),
+                        style,
+                    ))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(gutter_lines), editor_chunks[0]);
+
+            // Render code with cursor
             let styled_lines: Vec<Line> = visible_lines
                 .iter()
                 .enumerate()
                 .map(|(vi, line)| {
                     let actual_line = scroll + vi;
                     if actual_line == cursor_line {
-                        // Insert cursor marker
                         let col = cursor_col.min(line.len());
                         let before = &line[..col];
                         let cursor_char = if col < line.len() {
@@ -1496,7 +2022,7 @@ impl ComposerState {
 
             f.render_widget(
                 Paragraph::new(styled_lines),
-                inner,
+                editor_chunks[1],
             );
         } else {
             // Read-only view
@@ -1516,6 +2042,110 @@ impl ComposerState {
                 inner,
             );
         }
+    }
+
+    fn draw_field_editor(&self, f: &mut Frame, area: Rect, fe: &FieldEditor) {
+        let title = format!(" {} [editing] ", fe.field.label());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::GREEN))
+            .title(Span::styled(title, Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)))
+            .style(Style::default().bg(theme::BG));
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let text = &fe.text;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let total_lines = lines.len();
+        let gutter_width: u16 = if total_lines >= 100 { 5 } else { 4 };
+
+        // Find cursor line/col
+        let mut chars_counted = 0;
+        let mut cursor_line = 0;
+        let mut cursor_col = 0;
+        for (li, line) in text.split('\n').enumerate() {
+            if chars_counted + line.len() >= fe.cursor && fe.cursor >= chars_counted {
+                cursor_line = li;
+                cursor_col = fe.cursor - chars_counted;
+                break;
+            }
+            chars_counted += line.len() + 1;
+            cursor_line = li + 1;
+        }
+
+        // Auto-scroll
+        let visible_height = inner.height as usize;
+        let scroll = if cursor_line >= fe.scroll + visible_height {
+            cursor_line - visible_height + 1
+        } else if cursor_line < fe.scroll {
+            cursor_line
+        } else {
+            fe.scroll
+        };
+
+        let end = (scroll + visible_height).min(lines.len());
+        let visible_lines = &lines[scroll..end];
+
+        // Split into gutter + code
+        let editor_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(gutter_width), Constraint::Min(0)])
+            .split(inner);
+
+        // Render line numbers
+        let gutter_lines: Vec<Line> = visible_lines
+            .iter()
+            .enumerate()
+            .map(|(vi, _)| {
+                let line_num = scroll + vi + 1;
+                let is_cursor = scroll + vi == cursor_line;
+                let style = if is_cursor {
+                    Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::MUTED)
+                };
+                Line::from(Span::styled(
+                    format!("{:>width$} ", line_num, width = (gutter_width - 1) as usize),
+                    style,
+                ))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(gutter_lines), editor_chunks[0]);
+
+        // Render code with cursor
+        let styled_lines: Vec<Line> = visible_lines
+            .iter()
+            .enumerate()
+            .map(|(vi, line)| {
+                let actual_line = scroll + vi;
+                if actual_line == cursor_line {
+                    let col = cursor_col.min(line.len());
+                    let before = &line[..col];
+                    let cursor_char = if col < line.len() {
+                        &line[col..col + line[col..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)]
+                    } else {
+                        " "
+                    };
+                    let after = if col < line.len() {
+                        let skip = line[col..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                        &line[col + skip..]
+                    } else {
+                        ""
+                    };
+                    Line::from(vec![
+                        Span::styled(before.to_string(), Style::default().fg(theme::TEAL)),
+                        Span::styled(cursor_char.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT)),
+                        Span::styled(after.to_string(), Style::default().fg(theme::TEAL)),
+                    ])
+                } else {
+                    Line::from(Span::styled(line.to_string(), Style::default().fg(theme::TEAL)))
+                }
+            })
+            .collect();
+
+        f.render_widget(Paragraph::new(styled_lines), editor_chunks[1]);
     }
 
     pub fn handle_mouse_click(&mut self, row: u16, col: u16, area: &Rect) {
@@ -1715,34 +2345,104 @@ impl ComposerState {
         f.render_widget(List::new(items), search_chunks[2]);
     }
 
-    fn draw_load_file_dialog(&self, f: &mut Frame, area: Rect, path: &str) {
-        let popup_area = centered_rect(50, 5, area);
+    fn draw_file_browser(&self, f: &mut Frame, area: Rect, fb: &FileBrowserDialog) {
+        let h = area.height.clamp(12, 28);
+        let popup_area = centered_rect(70, h, area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(Span::styled(
-                " Load .sbatch File ",
+                " Open Script ",
                 Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Enter=open  Backspace=up  ~=home  Esc=cancel ",
+                Style::default().fg(theme::MUTED),
             ))
             .border_style(Style::default().fg(theme::ACCENT))
             .style(Style::default().bg(theme::SURFACE));
         let inner = block.inner(popup_area);
         f.render_widget(Clear, popup_area);
         f.render_widget(block, popup_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(inner);
+
+        // Current directory path
+        let dir_display = fb.current_dir.to_string_lossy();
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
-                    Span::styled("Path: ", Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{path}\u{2588}"), Style::default().fg(theme::TEXT)),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(dir_display.to_string(), Style::default().fg(theme::LAVENDER).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "Enter to load, Esc to cancel",
+            ]),
+            chunks[0],
+        );
+
+        // Error message
+        if let Some(ref err) = fb.error {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  {err}"),
+                    Style::default().fg(theme::RED),
+                )),
+                chunks[1],
+            );
+            return;
+        }
+
+        // Empty directory
+        if fb.entries.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "  No scripts found (.sbatch, .sh, .job)",
                     Style::default().fg(theme::MUTED),
                 )),
-            ]),
-            inner,
-        );
+                chunks[1],
+            );
+            return;
+        }
+
+        // File list
+        let visible_height = chunks[1].height as usize;
+        let scroll = fb.scroll.min(fb.entries.len().saturating_sub(visible_height));
+        let end = (scroll + visible_height).min(fb.entries.len());
+
+        let items: Vec<ListItem> = fb.entries[scroll..end]
+            .iter()
+            .enumerate()
+            .map(|(vi, entry)| {
+                let actual_idx = scroll + vi;
+                let is_sel = actual_idx == fb.selected;
+
+                let (icon, name_style) = if entry.is_dir {
+                    (" /", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+                } else if entry.is_compatible {
+                    (" *", Style::default().fg(theme::GREEN))
+                } else {
+                    ("  ", Style::default().fg(theme::MUTED))
+                };
+
+                let bg = if is_sel { theme::HIGHLIGHT } else { theme::SURFACE };
+                let suffix = if !entry.is_dir && !entry.is_compatible {
+                    Span::styled("  (not a valid script)", Style::default().fg(theme::MUTED).bg(bg))
+                } else {
+                    Span::raw("")
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {icon} "), Style::default().fg(if entry.is_dir { theme::ACCENT } else if entry.is_compatible { theme::GREEN } else { theme::MUTED }).bg(bg)),
+                    Span::styled(entry.name.clone(), name_style.bg(bg)),
+                    suffix,
+                ]))
+            })
+            .collect();
+
+        f.render_widget(List::new(items), chunks[1]);
     }
 }
 

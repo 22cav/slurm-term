@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6]
+
+### Added
+- **File browser for script loading**: replaced the text-input file dialog with a full filesystem browser (`Ctrl+O`). Navigates directories, shows only compatible files (`.sbatch`, `.sh`, `.job`), and validates script headers before loading.
+- **Full-featured text editor** in the preview pane: line numbers in gutter, word-level navigation (`Ctrl+Left/Right`), line operations (`Ctrl+K` kill line, `Ctrl+D` delete line, `Ctrl+U` clear to start), auto-indentation on Enter, and Tab/Shift+Tab for indent/dedent.
+- **Multiline field editor**: Modules, Env Vars, and Init Cmds now open in the right pane with the same full editor when pressing Enter, instead of inline editing. Fields show a clean summary in the form (e.g., `numpy, scipy  [2 modules]`).
+- **Native text selection in Inspector**: mouse capture is disabled when the inspector is open, allowing standard terminal drag-to-select and copy for job details and logs.
+
+### Fixed
+- **Log display corruption**: stripped ANSI escape sequences and handled carriage returns (`\r`) in log output, fixing lines overlaying each other in Follow mode.
+- **N/A fields in job inspector**: correctly parse Slurm 22+ JSON object wrappers (`{"number": N, "set": bool, "infinite": bool}`) and string-encoded numbers from mock/demo mode for time, memory, and all scalar fields.
+- **Form field highlight leak**: the focused form field no longer turns green when editing the preview pane; the green editing indicator now only appears on the active pane.
+
+### Changed
+- **Smarter log polling**: logs now refresh even when Follow is paused (at the main poll interval), and use file-size change detection to skip redundant re-reads when the file hasn't changed.
+- **Cleaner multiline field display**: Modules, Env Vars, and Init Cmds show a compact comma-separated summary with item count instead of raw multiline text in the form.
+- **Context-aware status bar**: the bottom hints now change between form-mode and editor-mode shortcuts when editing the preview pane.
+- Resolved all clippy warnings.
+
 ## [0.1.5]
 
 ### Fixed

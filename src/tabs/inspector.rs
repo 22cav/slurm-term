@@ -13,6 +13,55 @@ const METRICS_ROLLING_WINDOW: usize = 60;
 const MEMORY_FALLBACK_MB: u64 = 64_000;
 const LOG_TAIL_LINES: usize = 200;
 
+/// Strip ANSI escape sequences and handle carriage returns to produce clean log lines.
+fn sanitize_log_line(s: &str) -> String {
+    // Handle carriage returns: simulate terminal behavior by keeping only the last segment.
+    // e.g. "loading...\rDone!" -> "Done!"
+    let visible = if s.contains('\r') {
+        s.split('\r').next_back().unwrap_or(s)
+    } else {
+        s
+    };
+
+    // Strip ANSI/VT100 escape sequences.
+    let mut result = String::with_capacity(visible.len());
+    let mut chars = visible.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                match chars.peek().copied() {
+                    Some('[') => {
+                        // CSI sequence: ESC [ ... <final>
+                        chars.next(); // consume '['
+                        for nc in chars.by_ref() {
+                            if matches!(nc, 'A'..='Z' | 'a'..='z' | '~') {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        // OSC sequence: ESC ] ... BEL
+                        chars.next(); // consume ']'
+                        for nc in chars.by_ref() {
+                            if nc == '\x07' {
+                                break;
+                            }
+                        }
+                    }
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        chars.next(); // consume two-char escape (e.g. ESC M)
+                    }
+                    _ => {} // bare ESC, skip
+                }
+            }
+            // Strip other non-printable control characters except tab
+            '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1f' => {}
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
 pub enum Action {
     None,
     Back,
@@ -36,6 +85,7 @@ pub struct InspectorState {
     log_scroll: usize,
     log_mode: LogMode,
     pub log_follow: bool,
+    log_last_len: u64, // track file size to skip re-reads when unchanged
     // Metrics
     cpu_history: Vec<f64>,
     mem_history: Vec<f64>,
@@ -48,6 +98,39 @@ enum LogMode {
     Stderr,
 }
 
+/// Convert a Slurm JSON value to a displayable string.
+///
+/// Slurm 22+ encodes many scalar fields as `{"number": N, "set": bool, "infinite": bool}`.
+/// Arrays (e.g. `job_state`) are joined with commas.
+fn slurm_val_to_string(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => {
+            if s.is_empty() || s == "(null)" { String::new() } else { s.clone() }
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_json::Value::Object(map) => {
+            // `{"infinite": true, ...}` → "UNLIMITED"
+            if map.get("infinite").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return "UNLIMITED".to_string();
+            }
+            // `{"number": N, ...}` → "N"
+            if let Some(n) = map.get("number") {
+                return slurm_val_to_string(n);
+            }
+            // Fallback: serialize the whole object
+            val.to_string()
+        }
+        serde_json::Value::Null => String::new(),
+    }
+}
+
 impl InspectorState {
     pub fn new() -> Self {
         Self {
@@ -58,24 +141,91 @@ impl InspectorState {
             log_scroll: 0,
             log_mode: LogMode::Stdout,
             log_follow: true,
+            log_last_len: 0,
             cpu_history: Vec::new(),
             mem_history: Vec::new(),
             gpu_history: Vec::new(),
         }
     }
 
+    /// Extract a displayable string from a Slurm JSON field.
+    ///
+    /// Modern Slurm (22+) wraps many fields as objects like
+    /// `{"number": 4, "set": true, "infinite": false}` or arrays like `["RUNNING"]`.
+    /// This handles all these cases gracefully.
     fn get_str(&self, key: &str) -> String {
-        self.details
-            .as_ref()
-            .and_then(|d| d.get(key))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+        let Some(val) = self.details.as_ref().and_then(|d| d.get(key)) else {
+            return String::new();
+        };
+        slurm_val_to_string(val)
     }
 
     fn get_str_or(&self, key: &str, default: &str) -> String {
         let s = self.get_str(key);
         if s.is_empty() { default.to_string() } else { s }
+    }
+
+    /// Return a time field formatted as HH:MM:SS.
+    /// Slurm encodes `time_limit` in minutes and `run_time` in seconds
+    /// inside `{"number": N, ...}` objects, plain numbers, or strings.
+    fn get_time_str(&self, key: &str, in_minutes: bool) -> String {
+        let Some(val) = self.details.as_ref().and_then(|d| d.get(key)) else {
+            return "N/A".to_string();
+        };
+        let secs = match val {
+            serde_json::Value::Object(map) => {
+                if map.get("infinite").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return "UNLIMITED".to_string();
+                }
+                let n = map.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+                if in_minutes { n * 60 } else { n }
+            }
+            serde_json::Value::Number(n) => {
+                let n = n.as_i64().unwrap_or(0);
+                if in_minutes { n * 60 } else { n }
+            }
+            serde_json::Value::String(s) => {
+                // Already formatted time string like "01:30:00" — return as-is
+                if s.contains(':') {
+                    return s.clone();
+                }
+                // Numeric string
+                match s.parse::<i64>() {
+                    Ok(n) => if in_minutes { n * 60 } else { n },
+                    Err(_) => return s.clone(),
+                }
+            }
+            _ => return "N/A".to_string(),
+        };
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+
+    /// Return a memory field formatted as MB or GB.
+    /// Slurm encodes memory in MB inside `{"number": N, ...}` objects,
+    /// plain numbers, or numeric strings.
+    fn get_mem_str(&self, key: &str) -> String {
+        let Some(val) = self.details.as_ref().and_then(|d| d.get(key)) else {
+            return "N/A".to_string();
+        };
+        let mb = match val {
+            serde_json::Value::Object(map) => {
+                map.get("number").and_then(|v| v.as_i64()).unwrap_or(0)
+            }
+            serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+            serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
+            _ => return "N/A".to_string(),
+        };
+        if mb == 0 {
+            return "N/A".to_string();
+        }
+        if mb >= 1024 {
+            format!("{:.1} GB", mb as f64 / 1024.0)
+        } else {
+            format!("{mb} MB")
+        }
     }
 
     pub fn load_job(&mut self, job_id: &str, slurm: &dyn SlurmController) {
@@ -87,15 +237,20 @@ impl InspectorState {
         self.log_scroll = 0;
         self.log_mode = LogMode::Stdout;
         self.log_follow = true;
+        self.log_last_len = 0;
         self.sub_tab = SubTab::Overview;
         self.refresh(slurm);
+    }
+
+    pub fn is_viewing_logs(&self) -> bool {
+        self.sub_tab == SubTab::Logs
     }
 
     pub fn refresh(&mut self, slurm: &dyn SlurmController) {
         if let Some(ref jid) = self.job_id {
             self.details = slurm.get_job_details(jid);
             self.update_metrics(slurm);
-            self.load_log_tail();
+            self.load_log_tail_inner(true); // force on full refresh
         }
     }
 
@@ -172,6 +327,11 @@ impl InspectorState {
     }
 
     pub fn load_log_tail(&mut self) {
+        self.load_log_tail_inner(false);
+    }
+
+    /// Reload log file. If `force` is false, skip re-read when file size is unchanged.
+    fn load_log_tail_inner(&mut self, force: bool) {
         let path_key = match self.log_mode {
             LogMode::Stdout => "standard_output",
             LogMode::Stderr => "standard_error",
@@ -182,11 +342,25 @@ impl InspectorState {
             return;
         }
 
+        // Check file size first — skip read if unchanged (fast path for polling)
+        if !force {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let len = meta.len();
+                if len == self.log_last_len && !self.log_lines.is_empty() {
+                    return; // file hasn't changed
+                }
+            }
+        }
+
         match std::fs::File::open(&path) {
             Ok(file) => {
+                if let Ok(meta) = file.metadata() {
+                    self.log_last_len = meta.len();
+                }
                 let reader = std::io::BufReader::new(file);
                 let all_lines: Vec<String> = reader.lines()
                     .map_while(|l| l.ok())
+                    .map(|l| sanitize_log_line(&l))
                     .collect();
                 let start = all_lines.len().saturating_sub(LOG_TAIL_LINES);
                 self.log_lines = all_lines[start..].to_vec();
@@ -218,6 +392,7 @@ impl InspectorState {
                     LogMode::Stdout => LogMode::Stderr,
                     LogMode::Stderr => LogMode::Stdout,
                 };
+                self.log_last_len = 0; // force re-read on mode switch
                 self.load_log_tail();
             }
             KeyCode::Char('f') => {
@@ -331,12 +506,13 @@ impl InspectorState {
             ("Job ID", jid),
             ("Partition", self.get_str_or("partition", "N/A")),
             ("User", self.get_str_or("user_name", "N/A")),
+            ("State", self.get_str_or("job_state", "N/A")),
             ("Work Dir", self.get_str_or("working_directory", "N/A")),
             ("Nodes", self.get_str_or("nodes", "N/A")),
             ("CPUs/Task", self.get_str_or("cpus_per_task", "N/A")),
-            ("Memory", self.get_str_or("minimum_memory_per_node", "N/A")),
-            ("Time Limit", self.get_str_or("time_limit", "N/A")),
-            ("Run Time", self.get_str_or("run_time", "N/A")),
+            ("Memory", self.get_mem_str("minimum_memory_per_node")),
+            ("Time Limit", self.get_time_str("time_limit", true)),
+            ("Run Time", self.get_time_str("run_time", false)),
             ("stdout", self.get_str_or("standard_output", "N/A")),
             ("stderr", self.get_str_or("standard_error", "N/A")),
         ];

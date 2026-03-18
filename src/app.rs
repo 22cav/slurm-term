@@ -157,8 +157,21 @@ impl App {
         let tick_rate = Duration::from_millis(250);
         let mut last_poll = Instant::now();
         let mut last_inspector_poll = Instant::now();
+        let mut mouse_captured = true;
 
         loop {
+            // Toggle mouse capture: disable when inspector is open so the
+            // terminal handles native text selection (drag to select, copy).
+            let want_mouse = !(app.active_tab == TabId::Monitor && app.monitor.inspector.is_some());
+            if want_mouse != mouse_captured {
+                if want_mouse {
+                    execute!(io::stdout(), EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), DisableMouseCapture)?;
+                }
+                mouse_captured = want_mouse;
+            }
+
             terminal.draw(|f| app.draw(f))?;
 
             let timeout = tick_rate
@@ -180,12 +193,17 @@ impl App {
                 last_inspector_poll = Instant::now();
             }
 
-            // Fast inspector log refresh when following
+            // Fast inspector log refresh (always when viewing logs, faster when following)
             if app.active_tab == TabId::Monitor {
                 if let Some(ref mut insp) = app.monitor.inspector {
-                    if insp.log_follow
-                        && last_inspector_poll.elapsed()
-                            >= Duration::from_secs_f64(app.config.inspector_poll_interval)
+                    let interval = if insp.log_follow {
+                        app.config.inspector_poll_interval
+                    } else {
+                        // Still refresh logs periodically even when paused (at main poll rate)
+                        app.config.monitor_poll_interval
+                    };
+                    if insp.is_viewing_logs()
+                        && last_inspector_poll.elapsed() >= Duration::from_secs_f64(interval)
                     {
                         insp.load_log_tail();
                         last_inspector_poll = Instant::now();
@@ -416,15 +434,26 @@ impl App {
                 }
             }
             TabId::Composer => {
-                spans.extend(vec![
-                    key("Tab"), desc("Pane"), sep(),
-                    key("Enter"), desc("Edit"), sep(),
-                    key("?"), desc("Help"), sep(),
-                    key("a"), desc("Add Param"), sep(),
-                    key("^O"), desc("Load File"), sep(),
-                    key("^Y"), desc("Copy"), sep(),
-                    key("^S"), desc("Submit"),
-                ]);
+                if self.composer.active_pane == composer::Pane::Preview && self.composer.editing {
+                    spans.extend(vec![
+                        key("Esc"), desc("Stop"), sep(),
+                        key("^K"), desc("Kill Line"), sep(),
+                        key("^D"), desc("Del Line"), sep(),
+                        key("^A/^E"), desc("Home/End"), sep(),
+                        key("^W"), desc("Del Word"), sep(),
+                        key("^S"), desc("Submit"),
+                    ]);
+                } else {
+                    spans.extend(vec![
+                        key("Tab"), desc("Pane"), sep(),
+                        key("Enter"), desc("Edit"), sep(),
+                        key("?"), desc("Help"), sep(),
+                        key("a"), desc("Add Param"), sep(),
+                        key("^O"), desc("Browse"), sep(),
+                        key("^Y"), desc("Copy"), sep(),
+                        key("^S"), desc("Submit"),
+                    ]);
+                }
             }
             TabId::Hardware => {
                 spans.extend(vec![
@@ -657,7 +686,7 @@ impl App {
                     || self.composer.template_dialog.is_some()
                     || self.composer.help_overlay
                     || self.composer.add_param_dialog.is_some()
-                    || self.composer.load_file_dialog.is_some()
+                    || self.composer.file_browser.is_some()
             }
             _ => false,
         }
