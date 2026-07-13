@@ -65,7 +65,10 @@ fn main() {
     let slurm: Box<dyn SlurmController + Send> = if demo {
         Box::new(mock_slurm::MockSlurmController::new(8, Some(42)))
     } else {
-        Box::new(slurm_api::RealSlurmController)
+        Box::new(
+            slurm_api::RealSlurmController::new(cfg.subprocess_timeout)
+                .with_gpu_command(&cfg.gpu_monitor_command),
+        )
     };
 
     if let Err(e) = App::run(slurm, cfg, load_file) {

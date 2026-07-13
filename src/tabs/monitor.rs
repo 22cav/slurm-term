@@ -46,6 +46,8 @@ pub struct MonitorState {
     pub search_query: String,
     pub selected: HashSet<String>,
     pub inspector: Option<InspectorState>,
+    /// Passed to inspectors opened from this tab (config [gpu] enabled).
+    pub gpu_enabled: bool,
     sort_col: SortCol,
     sort_asc: bool,
 }
@@ -59,6 +61,7 @@ impl Default for MonitorState {
             search_query: String::new(),
             selected: HashSet::new(),
             inspector: None,
+            gpu_enabled: false,
             sort_col: SortCol::Id,
             sort_asc: true,
         }
@@ -187,7 +190,7 @@ impl MonitorState {
             }
             KeyCode::Enter | KeyCode::Char('i') => {
                 if let Some(id) = self.get_cursor_job_id() {
-                    let mut insp = InspectorState::new();
+                    let mut insp = InspectorState::new(self.gpu_enabled);
                     insp.load_job(&id, slurm);
                     self.inspector = Some(insp);
                 }

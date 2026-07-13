@@ -16,6 +16,7 @@ use crate::validators::{parse_time, parse_memory, validate_job_name};
 pub enum Action {
     None,
     Submit(HashMap<String, String>, String, String), // (params, script_path, wrap_commands)
+    RunInteractive(Vec<String>), // full srun argv for a terminal handover
     Status(String),
 }
 
@@ -473,21 +474,32 @@ impl ComposerState {
         None
     }
 
+    /// Argv for the interactive srun session. The preview keeps a literal
+    /// "$SHELL" for readability; at launch time the shell is resolved from
+    /// the environment (srun does not expand it for us).
+    fn build_srun_args(&self, resolve_shell: bool) -> Vec<String> {
+        let params = self.build_params();
+        let mut sorted: Vec<_> = params.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut parts = vec!["srun".to_string(), "--pty".to_string()];
+        for (k, v) in &sorted {
+            if v.is_empty() {
+                parts.push(format!("--{k}"));
+            } else {
+                parts.push(format!("--{k}={v}"));
+            }
+        }
+        parts.push(if resolve_shell {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+        } else {
+            "$SHELL".to_string()
+        });
+        parts
+    }
+
     fn generate_preview(&self) -> String {
         if self.mode_is_srun {
-            let params = self.build_params();
-            let mut sorted: Vec<_> = params.into_iter().collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut parts = vec!["srun".to_string(), "--pty".to_string()];
-            for (k, v) in &sorted {
-                if v.is_empty() {
-                    parts.push(format!("--{k}"));
-                } else {
-                    parts.push(format!("--{k}={v}"));
-                }
-            }
-            parts.push("$SHELL".to_string());
-            parts.join(" \\\n  ")
+            self.build_srun_args(false).join(" \\\n  ")
         } else {
             let mut lines = vec!["#!/bin/bash".to_string()];
             let params = self.build_params();
@@ -751,9 +763,15 @@ impl ComposerState {
             if let Some(err) = self.validate() {
                 return Action::Status(format!("! {err}"));
             }
+            if self.mode_is_srun {
+                // Interactive mode launches srun with the real terminal —
+                // submitting the wrap script via sbatch would silently turn
+                // the advertised interactive session into a batch job.
+                return Action::RunInteractive(self.build_srun_args(true));
+            }
             let params = self.build_params();
             let script = self.get(Field::Script);
-            if script.is_empty() && !self.mode_is_srun {
+            if script.is_empty() {
                 // sbatch mode without script path: submit full generated script as temp file
                 let body = self.generate_preview();
                 return Action::Submit(params, String::new(), body);

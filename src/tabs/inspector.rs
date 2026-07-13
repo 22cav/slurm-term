@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::slurm_api::SlurmController;
+use crate::slurm_api::{job_state_of, slurm_val_to_string, SlurmController};
 use crate::theme;
 use crate::validators::{parse_rss_to_pct, parse_cpu_pct};
 
@@ -79,6 +79,7 @@ enum SubTab {
 pub struct InspectorState {
     pub job_id: Option<String>,
     pub details: Option<serde_json::Value>,
+    gpu_enabled: bool,
     sub_tab: SubTab,
     // Logs
     log_lines: Vec<String>,
@@ -98,44 +99,12 @@ enum LogMode {
     Stderr,
 }
 
-/// Convert a Slurm JSON value to a displayable string.
-///
-/// Slurm 22+ encodes many scalar fields as `{"number": N, "set": bool, "infinite": bool}`.
-/// Arrays (e.g. `job_state`) are joined with commas.
-fn slurm_val_to_string(val: &serde_json::Value) -> String {
-    match val {
-        serde_json::Value::String(s) => {
-            if s.is_empty() || s == "(null)" { String::new() } else { s.clone() }
-        }
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(", "),
-        serde_json::Value::Object(map) => {
-            // `{"infinite": true, ...}` → "UNLIMITED"
-            if map.get("infinite").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return "UNLIMITED".to_string();
-            }
-            // `{"number": N, ...}` → "N"
-            if let Some(n) = map.get("number") {
-                return slurm_val_to_string(n);
-            }
-            // Fallback: serialize the whole object
-            val.to_string()
-        }
-        serde_json::Value::Null => String::new(),
-    }
-}
-
 impl InspectorState {
-    pub fn new() -> Self {
+    pub fn new(gpu_enabled: bool) -> Self {
         Self {
             job_id: None,
             details: None,
+            gpu_enabled,
             sub_tab: SubTab::Overview,
             log_lines: Vec::new(),
             log_scroll: 0,
@@ -279,10 +248,9 @@ impl InspectorState {
             return;
         }
 
-        let state = details.get("job_state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UNKNOWN");
-        if state != "RUNNING" {
+        // Modern Slurm --json reports job_state as an array (["RUNNING"]);
+        // job_state_of handles both that and the legacy plain string.
+        if job_state_of(details) != "RUNNING" {
             return;
         }
 
@@ -314,9 +282,26 @@ impl InspectorState {
         let cpu_val = parse_cpu_pct(&sstat.avg_cpu, run_time);
         let mem_val = parse_rss_to_pct(&sstat.max_rss, total_mem_mb);
 
+        // GPU sampling is opt-in ([gpu] enabled in config): it may ssh to the
+        // job's first node, which blocks the UI thread for up to one tick.
+        let gpu_val = if self.gpu_enabled {
+            crate::slurm_api::first_node_of(&self.get_str("nodes"))
+                .map(|node| {
+                    let samples = slurm.get_gpu_utilization(Some(&node));
+                    if samples.is_empty() {
+                        0.0
+                    } else {
+                        samples.iter().sum::<f64>() / samples.len() as f64
+                    }
+                })
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
         self.cpu_history.push(cpu_val);
         self.mem_history.push(mem_val);
-        self.gpu_history.push(0.0);
+        self.gpu_history.push(gpu_val);
 
         for hist in [&mut self.cpu_history, &mut self.mem_history, &mut self.gpu_history] {
             if hist.len() > METRICS_ROLLING_WINDOW {
@@ -330,6 +315,13 @@ impl InspectorState {
         self.load_log_tail_inner(false);
     }
 
+    /// Keep the scroll offset within the current log buffer. The buffer can
+    /// shrink between polls (e.g. the job finished and its log path vanished),
+    /// so every path that replaces `log_lines` must re-clamp.
+    fn clamp_log_scroll(&mut self) {
+        self.log_scroll = self.log_scroll.min(self.log_lines.len().saturating_sub(1));
+    }
+
     /// Reload log file. If `force` is false, skip re-read when file size is unchanged.
     fn load_log_tail_inner(&mut self, force: bool) {
         let path_key = match self.log_mode {
@@ -339,6 +331,7 @@ impl InspectorState {
         let path = self.get_str(path_key);
         if path.is_empty() || path == "(null)" {
             self.log_lines = vec!["No log file path available".to_string()];
+            self.clamp_log_scroll();
             return;
         }
 
@@ -372,6 +365,7 @@ impl InspectorState {
                 self.log_lines = vec![format!("Cannot read {path}: {e}")];
             }
         }
+        self.clamp_log_scroll();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, slurm: &dyn SlurmController) -> Action {
@@ -574,7 +568,10 @@ impl InspectorState {
         );
 
         let visible_height = chunks[1].height as usize;
-        let start = self.log_scroll.saturating_sub(visible_height.saturating_sub(1));
+        // log_scroll is clamped on reload, but this runs every frame between
+        // state changes — re-derive a safe scroll so start can never pass end.
+        let scroll = self.log_scroll.min(self.log_lines.len().saturating_sub(1));
+        let start = scroll.saturating_sub(visible_height.saturating_sub(1));
         let end = (start + visible_height).min(self.log_lines.len());
 
         let text: Vec<Line> = self.log_lines[start..end]
@@ -670,5 +667,58 @@ impl InspectorState {
     pub fn scroll_logs_up(&mut self) {
         self.log_scroll = self.log_scroll.saturating_sub(1);
         self.log_follow = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn inspector_on_logs(log_lines: Vec<String>, log_scroll: usize) -> InspectorState {
+        let mut insp = InspectorState::new(false);
+        insp.job_id = Some("123".to_string());
+        insp.sub_tab = SubTab::Logs;
+        insp.log_lines = log_lines;
+        insp.log_scroll = log_scroll;
+        insp
+    }
+
+    fn draw_to_test_backend(insp: &InspectorState, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| insp.draw(f, f.area())).unwrap();
+    }
+
+    /// Regression: the log buffer shrank (job finished, log path gone) while
+    /// log_scroll still pointed past the end — draw must not panic.
+    #[test]
+    fn draw_logs_with_stale_scroll_does_not_panic() {
+        let insp = inspector_on_logs(vec!["only line".to_string()], 500);
+        draw_to_test_backend(&insp, 80, 24);
+    }
+
+    #[test]
+    fn draw_logs_with_empty_buffer_does_not_panic() {
+        let insp = inspector_on_logs(Vec::new(), 42);
+        draw_to_test_backend(&insp, 80, 24);
+    }
+
+    #[test]
+    fn draw_logs_in_tiny_terminal_does_not_panic() {
+        let lines = (0..300).map(|i| format!("line {i}")).collect();
+        let insp = inspector_on_logs(lines, 299);
+        draw_to_test_backend(&insp, 10, 3);
+    }
+
+    #[test]
+    fn clamp_log_scroll_pulls_offset_into_range() {
+        let mut insp = inspector_on_logs(vec!["a".to_string()], 500);
+        insp.clamp_log_scroll();
+        assert_eq!(insp.log_scroll, 0);
+        insp.log_lines.clear();
+        insp.clamp_log_scroll();
+        assert_eq!(insp.log_scroll, 0);
     }
 }

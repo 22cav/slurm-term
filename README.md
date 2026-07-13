@@ -12,7 +12,7 @@ Monitor jobs, compose batch scripts or interactive sessions, explore cluster har
 ## Features
 
 - **Jobs** — Live job queue with search, selection, bulk cancel/hold/release, and inline inspection
-- **Submit** — Interactive job composer with form + preview pane, input validation, parameter catalog with docs (`?`), and `.sbatch` file loading (`Ctrl+O`)
+- **Submit** — Interactive job composer with form + preview pane, input validation, parameter catalog with docs (`?`), and `.sbatch` file loading (`Ctrl+O`). In `srun` mode, submitting suspends the TUI and drops you into the interactive session; exit the shell to return
 - **Cluster** — Partition and node hardware overview
 - **History** — Completed job history with configurable time window
 - **Mouse support** — Click to navigate tabs, select jobs, and interact with the form
@@ -119,6 +119,14 @@ history = 60.0
 
 [general]
 history_window = "now-7days"
+subprocess_timeout = 30.0   # hard deadline for slurm commands (seconds)
+
+[gpu]
+# Opt-in GPU sparkline for the job inspector. Samples utilization on the
+# job's first node via `ssh <node> <command>` (BatchMode, 2s connect timeout),
+# so passwordless ssh to compute nodes is required.
+enabled = false
+command = "nvidia-smi"
 ```
 
 Override the config path with `SLURMTERM_CONFIG=/path/to/config.toml`.

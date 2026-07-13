@@ -67,6 +67,10 @@ pub struct App {
     // Confirm dialog
     pub confirm: Option<ConfirmDialog>,
 
+    // Deferred srun handover: set in handle_key (no terminal access there),
+    // executed by the run loop which owns the terminal.
+    pending_interactive: Option<Vec<String>>,
+
     // Layout regions for mouse hit-testing
     tab_rects: Vec<(TabId, Rect)>,
     content_area: Rect,
@@ -109,6 +113,7 @@ impl App {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
+        let gpu_enabled = config.gpu_monitor_enabled;
         let history_window = config.history_window.clone();
         // Parse "now-Xdays" format to extract days count
         let history_days: u32 = history_window
@@ -125,11 +130,16 @@ impl App {
             hostname,
             status: None,
             should_quit: false,
-            monitor: MonitorState::default(),
+            monitor: {
+                let mut m = MonitorState::default();
+                m.gpu_enabled = gpu_enabled;
+                m
+            },
             composer: ComposerState::new(),
             hardware: HardwareState::new(),
             history: HistoryState::new(history_days),
             confirm: None,
+            pending_interactive: None,
             tab_rects: Vec::new(),
             content_area: Rect::default(),
             last_area: Rect::default(),
@@ -187,6 +197,24 @@ impl App {
                 }
             }
 
+            // Interactive srun handover requested by the Composer
+            if let Some(args) = app.pending_interactive.take() {
+                match Self::run_interactive_session(&mut terminal, &args)? {
+                    Ok(code) => {
+                        let msg = match code {
+                            Some(0) => "Interactive session ended".to_string(),
+                            Some(c) => format!("srun exited with code {c}"),
+                            None => "srun terminated by signal".to_string(),
+                        };
+                        app.set_status(&msg);
+                    }
+                    Err(e) => app.set_status(&format!("! Failed to start srun: {e}")),
+                }
+                // The restore re-enabled mouse capture; keep bookkeeping in sync.
+                mouse_captured = true;
+                app.poll_all();
+            }
+
             if last_poll.elapsed() >= Duration::from_secs_f64(app.poll_interval()) {
                 app.poll_active_tab();
                 last_poll = Instant::now();
@@ -211,6 +239,10 @@ impl App {
                 }
             }
 
+            // Surface any command error recorded during this iteration's
+            // polls or key-triggered actions (once per loop, all sources).
+            app.surface_slurm_error();
+
             if app.should_quit {
                 break;
             }
@@ -219,6 +251,57 @@ impl App {
         terminal::disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
         Ok(())
+    }
+
+    /// Suspend the TUI, hand the real terminal to srun (which needs the tty
+    /// for its --pty session), and restore the TUI when the shell exits.
+    ///
+    /// Outer error: terminal restore failed (fatal for the app).
+    /// Inner result: srun's exit code, or a launch-failure message.
+    fn run_interactive_session(
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        args: &[String],
+    ) -> io::Result<Result<Option<i32>, String>> {
+        terminal::disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        )?;
+        println!("Starting interactive session: {}", args.join(" "));
+        println!("(waiting for allocation — exit the shell to return to slurm-term)");
+
+        // Ctrl+C at the terminal signals the whole foreground process group;
+        // ignore it here so only srun/the shell react and the suspended TUI
+        // survives. (A panic in this window is still safe: the panic hook's
+        // teardown calls are no-ops while the TUI is already suspended.)
+        #[cfg(unix)]
+        let previous_sigint = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+
+        let status = std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .status();
+
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGINT, previous_sigint);
+        }
+
+        terminal::enable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
+        // Force a full repaint — the shell overwrote the whole screen.
+        terminal.clear()?;
+
+        Ok(match status {
+            Ok(s) => Ok(s.code()),
+            Err(e) => Err(e.to_string()),
+        })
     }
 
     fn poll_interval(&self) -> f64 {
@@ -253,10 +336,22 @@ impl App {
     }
 
     fn set_status(&mut self, msg: &str) {
+        self.set_status_ttl(msg, 5);
+    }
+
+    fn set_status_ttl(&mut self, msg: &str, secs: u64) {
         self.status = Some(StatusMsg {
             text: msg.to_string(),
-            expires: Instant::now() + Duration::from_secs(5),
+            expires: Instant::now() + Duration::from_secs(secs),
         });
+    }
+
+    /// Show the most recent Slurm command failure in the status bar. Views
+    /// keep rendering (empty if need be) — this explains why they are empty.
+    fn surface_slurm_error(&mut self) {
+        if let Some(err) = self.slurm.take_last_error() {
+            self.set_status_ttl(&format!("! {err}"), 10);
+        }
     }
 
     fn draw(&mut self, f: &mut Frame) {
@@ -321,7 +416,7 @@ impl App {
         ));
         let node_color = if is_login { theme::GREEN } else { theme::YELLOW };
         let node_span_len = node_display.len() as u16 + 1; // +1 for trailing space
-        let node_x = chunks[0].x + chunks[0].width - node_span_len;
+        let node_x = (chunks[0].x + chunks[0].width).saturating_sub(node_span_len);
         self.hostname_rect = Rect::new(node_x, chunks[0].y, node_span_len, 1);
         tab_spans.push(Span::styled(
             node_display,
@@ -648,6 +743,13 @@ impl App {
                             Err(e) => self.set_status(&format!("Submit failed: {e}")),
                         }
                     }
+                    composer::Action::RunInteractive(args) => {
+                        if self.slurm.supports_interactive() {
+                            self.pending_interactive = Some(args);
+                        } else {
+                            self.set_status("! Interactive srun is not available in --demo mode");
+                        }
+                    }
                     composer::Action::Status(msg) => {
                         self.set_status(&msg);
                     }
@@ -665,7 +767,9 @@ impl App {
                     history::Action::None => {}
                     history::Action::Inspect(job_id) => {
                         // Open in monitor's inline inspector
-                        let mut insp = crate::tabs::inspector::InspectorState::new();
+                        let mut insp = crate::tabs::inspector::InspectorState::new(
+                            self.config.gpu_monitor_enabled,
+                        );
                         insp.load_job(&job_id, &*self.slurm);
                         self.monitor.inspector = Some(insp);
                         self.active_tab = TabId::Monitor;

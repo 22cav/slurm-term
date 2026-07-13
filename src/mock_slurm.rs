@@ -255,6 +255,10 @@ impl SlurmController for MockSlurmController {
         "demo-cluster".to_string()
     }
 
+    fn supports_interactive(&self) -> bool {
+        false
+    }
+
     fn get_queue(&self, _user: Option<&str>) -> Vec<JobInfo> {
         let mut inner = self.inner.borrow_mut();
         inner.tick();
@@ -292,26 +296,29 @@ impl SlurmController for MockSlurmController {
         let inner = self.inner.borrow();
         let j = inner.jobs.iter().find(|j| j.id == job_id)?;
         let profile = match j.partition.as_str() {
-            "debug" => ("4", "16000", ""),
-            "gpu" => ("8", "32000", "gpu:a100:1"),
-            "bigmem" => ("32", "256000", ""),
-            _ => ("16", "64000", ""),
+            "debug" => (4, 16_000, ""),
+            "gpu" => (8, 32_000, "gpu:a100:1"),
+            "bigmem" => (32, 256_000, ""),
+            _ => (16, 64_000, ""),
         };
 
+        // Mirror the shapes modern Slurm --json actually emits (job_state as
+        // an array, scalars wrapped in {number,set,infinite}) so demo mode
+        // exercises the same handling as a real cluster.
         let details = serde_json::json!({
             "job_id": j.id,
             "name": j.name,
-            "job_state": j.state,
+            "job_state": [j.state],
             "partition": j.partition,
             "user_name": j.user,
             "working_directory": format!("/home/{}/projects/{}", j.user, j.name),
             "nodes": j.node_list,
             "standard_output": j.log_path,
             "standard_error": j.log_path.replace(".out", ".err"),
-            "time_limit": j.time_limit / 60,
-            "run_time": j.elapsed,
-            "cpus_per_task": profile.0,
-            "minimum_memory_per_node": profile.1,
+            "time_limit": {"set": true, "infinite": false, "number": j.time_limit / 60},
+            "run_time": {"set": true, "infinite": false, "number": j.elapsed},
+            "cpus_per_task": {"set": true, "infinite": false, "number": profile.0},
+            "minimum_memory_per_node": {"set": true, "infinite": false, "number": profile.1},
             "gres_detail": profile.2,
             "slurmterm_metrics": {
                 "cpu": j.metrics.cpu,
@@ -470,19 +477,32 @@ impl SlurmController for MockSlurmController {
             } else {
                 format!("{}:0", inner.rng.range(1, 128))
             };
-            let max_rss = format!("{}M", inner.rng.range(500, 64000));
+            // Like real sacct: the job row has no MaxRSS/TotalCPU — only the
+            // .batch step row carries them (in kilobytes). This exercises the
+            // same step-merge logic used for real cluster output.
+            let max_rss_kb = format!("{}K", inner.rng.range(500, 64000) * 1024);
             rows.push(SacctRow {
-                job_id: jid,
+                job_id: jid.clone(),
                 name: inner.rng.choice(JOB_NAMES).to_string(),
                 partition: inner.rng.choice(PARTITIONS).to_string(),
+                state: state.clone(),
+                elapsed: elapsed.clone(),
+                total_cpu: String::new(),
+                max_rss: String::new(),
+                exit_code: exit_code.clone(),
+            });
+            rows.push(SacctRow {
+                job_id: format!("{jid}.batch"),
+                name: "batch".to_string(),
+                partition: String::new(),
                 state,
                 elapsed,
                 total_cpu: "01:23:45".into(),
-                max_rss,
+                max_rss: max_rss_kb,
                 exit_code,
             });
         }
-        rows
+        crate::slurm_api::merge_sacct_steps(rows)
     }
 
     fn get_sstat(&self, job_id: &str) -> Option<SstatResult> {
@@ -493,10 +513,13 @@ impl SlurmController for MockSlurmController {
         }
         let cpu_pct = j.metrics.cpu.last().copied().unwrap_or(50.0);
         let mem_mb = (j.metrics.mem.last().copied().unwrap_or(50.0) / 100.0 * 32000.0) as i64;
+        // Real sstat formats: AveCPU is a duration, MaxRSS is in kilobytes.
+        let cpu_secs = (cpu_pct / 100.0 * j.elapsed as f64) as i64;
+        let (h, m, s) = (cpu_secs / 3600, (cpu_secs % 3600) / 60, cpu_secs % 60);
         Some(SstatResult {
-            avg_cpu: format!("{cpu_pct:.0}%"),
-            max_rss: format!("{mem_mb}M"),
-            max_vmsize: format!("{}M", mem_mb + 2000),
+            avg_cpu: format!("{h:02}:{m:02}:{s:02}"),
+            max_rss: format!("{}K", mem_mb * 1024),
+            max_vmsize: format!("{}K", (mem_mb + 2000) * 1024),
         })
     }
 

@@ -5,3 +5,4 @@ __pycache__
 *.whl
 *.tar.gz
 PUBLISH.md
+.DS_Store

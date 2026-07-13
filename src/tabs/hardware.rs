@@ -4,6 +4,7 @@ use ratatui::widgets::*;
 
 use crate::slurm_api::{SinfoRow, NodeInfoRow, StorageInfo, SlurmController};
 use crate::theme;
+use crate::validators::{mib_to_gib, node_state_color};
 
 pub enum Action {
     None,
@@ -221,7 +222,7 @@ impl HardwareState {
             Cell::from(h("Nodes", PartSortCol::Nodes)),
             Cell::from(h("State", PartSortCol::State)),
             Cell::from(h("CPUs", PartSortCol::Cpus)),
-            Cell::from("Mem(GB)"),
+            Cell::from("Mem(GiB)"),
             Cell::from("GRES"),
         ])
         .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD));
@@ -242,19 +243,22 @@ impl HardwareState {
         let rows: Vec<Row> = sorted
             .iter()
             .map(|p| {
-                let state_style = match p.state.as_str() {
+                // Avail is sinfo %a (up/down/drain/inact); State is %T (a
+                // node state like idle/mixed/allocated) — style them apart.
+                let avail_style = match p.avail.to_lowercase().as_str() {
                     "up" => Style::default().fg(theme::GREEN),
                     "down" => Style::default().fg(theme::RED),
                     _ => Style::default().fg(theme::YELLOW),
                 };
+                let state_style = Style::default().fg(node_state_color(&p.state));
                 Row::new(vec![
                     Cell::from(format!("  {}", p.partition)).style(Style::default().fg(theme::TEXT)),
-                    Cell::from(p.avail.as_str()).style(state_style),
+                    Cell::from(p.avail.as_str()).style(avail_style),
                     Cell::from(p.timelimit.as_str()).style(Style::default().fg(theme::DIM)),
                     Cell::from(p.nodes.as_str()).style(Style::default().fg(theme::DIM)),
                     Cell::from(p.state.as_str()).style(state_style),
                     Cell::from(p.cpus.as_str()).style(Style::default().fg(theme::DIM)),
-                    Cell::from(p.memory.as_str()).style(Style::default().fg(theme::DIM)),
+                    Cell::from(mib_to_gib(&p.memory)).style(Style::default().fg(theme::DIM)),
                     Cell::from(p.gres.as_str()).style(Style::default().fg(theme::MUTED)),
                 ])
             })
@@ -288,11 +292,11 @@ impl HardwareState {
             Cell::from(h("  Node", NodeSortCol::Node)),
             Cell::from(h("State", NodeSortCol::State)),
             Cell::from(h("CPUs", NodeSortCol::Cpus)),
-            Cell::from(h("Mem(GB)", NodeSortCol::Mem)),
+            Cell::from(h("Mem(GiB)", NodeSortCol::Mem)),
             Cell::from("GRES"),
             Cell::from("Partitions"),
             Cell::from(h("Load", NodeSortCol::Load)),
-            Cell::from("Free(GB)"),
+            Cell::from("Free(GiB)"),
         ])
         .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD));
 
@@ -300,12 +304,24 @@ impl HardwareState {
         let asc = self.node_sort_asc;
         sorted.sort_by(|a, b| {
             let get = |n: &NodeInfoRow, k: &str| n.fields.get(k).cloned().unwrap_or_default();
+            // Numeric columns must not be compared as strings ("9" > "128000")
+            let num = |n: &NodeInfoRow, k: &str| -> f64 {
+                n.fields
+                    .get(k)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            };
+            let numcmp = |k: &str| {
+                num(a, k)
+                    .partial_cmp(&num(b, k))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            };
             let ord = match self.node_sort_col {
                 NodeSortCol::Node => get(a, "NodeName").cmp(&get(b, "NodeName")),
                 NodeSortCol::State => get(a, "State").cmp(&get(b, "State")),
-                NodeSortCol::Cpus => get(a, "CPUTot").cmp(&get(b, "CPUTot")),
-                NodeSortCol::Mem => get(a, "RealMemory").cmp(&get(b, "RealMemory")),
-                NodeSortCol::Load => get(a, "CPULoad").cmp(&get(b, "CPULoad")),
+                NodeSortCol::Cpus => numcmp("CPUTot"),
+                NodeSortCol::Mem => numcmp("RealMemory"),
+                NodeSortCol::Load => numcmp("CPULoad"),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -317,24 +333,16 @@ impl HardwareState {
                     n.fields.get(key).cloned().unwrap_or_default()
                 };
                 let state = f("State");
-                let state_style = if state.contains("idle") {
-                    Style::default().fg(theme::GREEN)
-                } else if state.contains("alloc") {
-                    Style::default().fg(theme::YELLOW)
-                } else if state.contains("down") || state.contains("drain") {
-                    Style::default().fg(theme::RED)
-                } else {
-                    Style::default().fg(theme::DIM)
-                };
+                let state_style = Style::default().fg(node_state_color(&state));
                 Row::new(vec![
                     Cell::from(format!("  {}", f("NodeName"))).style(Style::default().fg(theme::TEXT)),
                     Cell::from(state).style(state_style),
                     Cell::from(f("CPUTot")).style(Style::default().fg(theme::DIM)),
-                    Cell::from(f("RealMemory")).style(Style::default().fg(theme::DIM)),
+                    Cell::from(mib_to_gib(&f("RealMemory"))).style(Style::default().fg(theme::DIM)),
                     Cell::from(f("Gres")).style(Style::default().fg(theme::MUTED)),
                     Cell::from(f("Partitions")).style(Style::default().fg(theme::MUTED)),
                     Cell::from(f("CPULoad")).style(Style::default().fg(theme::DIM)),
-                    Cell::from(f("FreeMem")).style(Style::default().fg(theme::DIM)),
+                    Cell::from(mib_to_gib(&f("FreeMem"))).style(Style::default().fg(theme::DIM)),
                 ])
             })
             .collect();
@@ -343,11 +351,11 @@ impl HardwareState {
             Constraint::Min(14),
             Constraint::Length(10),
             Constraint::Length(6),
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Min(10),
             Constraint::Min(12),
             Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(9),
         ];
 
         let table = Table::new(rows, widths)

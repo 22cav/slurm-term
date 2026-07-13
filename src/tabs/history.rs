@@ -214,14 +214,10 @@ impl HistoryState {
             .iter()
             .map(|&i| {
                 let r = &self.rows[i];
-                let state_style = match r.state.as_str() {
-                    "COMPLETED" => Style::default().fg(theme::GREEN),
-                    "FAILED" | "NODE_FAIL" => Style::default().fg(theme::RED),
-                    "TIMEOUT" | "CANCELLED" => Style::default().fg(theme::YELLOW),
-                    "RUNNING" => Style::default().fg(theme::ACCENT),
-                    "PENDING" => Style::default().fg(theme::MUTED),
-                    _ => Style::default().fg(theme::DIM),
-                };
+                // Shared mapping keeps History consistent with the Jobs tab
+                // and copes with sacct suffixes like "CANCELLED by <uid>".
+                let state_style =
+                    Style::default().fg(crate::validators::state_color(&r.state));
                 Row::new(vec![
                     Cell::from(format!("  {}", r.job_id)).style(Style::default().fg(theme::TEXT)),
                     Cell::from(r.name.as_str()).style(Style::default().fg(theme::TEXT)),
