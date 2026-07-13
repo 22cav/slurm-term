@@ -1,7 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::slurm_api::*;
+use crate::slurm_api::{
+    merge_sacct_steps, JobInfo, NodeInfoRow, SacctRow, SinfoRow, SlurmController, SstatResult,
+    StorageInfo,
+};
+use crate::validators::format_hms;
 
 const PARTITIONS: &[&str] = &["debug", "batch", "gpu", "bigmem"];
 const JOB_NAMES: &[&str] = &[
@@ -216,15 +220,11 @@ impl MockInner {
                         self.jobs[i].state = "COMPLETING".to_string();
                     }
                 }
-                "COMPLETING" => {
-                    if self.rng.chance(0.4) {
-                        self.jobs[i].state = "COMPLETED".to_string();
-                    }
+                "COMPLETING" if self.rng.chance(0.4) => {
+                    self.jobs[i].state = "COMPLETED".to_string();
                 }
-                "PENDING" => {
-                    if age > 10.0 && self.rng.chance(0.15) {
-                        self.jobs[i].state = "RUNNING".to_string();
-                    }
+                "PENDING" if age > 10.0 && self.rng.chance(0.15) => {
+                    self.jobs[i].state = "RUNNING".to_string();
                 }
                 _ => {}
             }
@@ -269,12 +269,7 @@ impl SlurmController for MockSlurmController {
                 name: j.name.clone(),
                 partition: j.partition.clone(),
                 state: j.state.clone(),
-                time_used: {
-                    let h = j.elapsed / 3600;
-                    let m = (j.elapsed % 3600) / 60;
-                    let s = j.elapsed % 60;
-                    format!("{h:02}:{m:02}:{s:02}")
-                },
+                time_used: format_hms(j.elapsed),
                 nodes: j.nodes.clone(),
                 reason: j.reason.clone(),
                 user: j.user.clone(),
@@ -463,10 +458,7 @@ impl SlurmController for MockSlurmController {
         for i in 0..15 {
             let jid = format!("{}", 99900 + i);
             let elapsed_s = inner.rng.range(120, 86400);
-            let h = elapsed_s / 3600;
-            let m = (elapsed_s % 3600) / 60;
-            let s = elapsed_s % 60;
-            let elapsed = format!("{h:02}:{m:02}:{s:02}");
+            let elapsed = format_hms(elapsed_s);
             let state_choices = &[
                 "COMPLETED", "COMPLETED", "COMPLETED", "COMPLETED", "COMPLETED", "COMPLETED",
                 "FAILED", "FAILED", "TIMEOUT", "CANCELLED",
@@ -502,7 +494,7 @@ impl SlurmController for MockSlurmController {
                 exit_code,
             });
         }
-        crate::slurm_api::merge_sacct_steps(rows)
+        merge_sacct_steps(rows)
     }
 
     fn get_sstat(&self, job_id: &str) -> Option<SstatResult> {
@@ -515,9 +507,8 @@ impl SlurmController for MockSlurmController {
         let mem_mb = (j.metrics.mem.last().copied().unwrap_or(50.0) / 100.0 * 32000.0) as i64;
         // Real sstat formats: AveCPU is a duration, MaxRSS is in kilobytes.
         let cpu_secs = (cpu_pct / 100.0 * j.elapsed as f64) as i64;
-        let (h, m, s) = (cpu_secs / 3600, (cpu_secs % 3600) / 60, cpu_secs % 60);
         Some(SstatResult {
-            avg_cpu: format!("{h:02}:{m:02}:{s:02}"),
+            avg_cpu: format_hms(cpu_secs),
             max_rss: format!("{}K", mem_mb * 1024),
             max_vmsize: format!("{}K", (mem_mb + 2000) * 1024),
         })

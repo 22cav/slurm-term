@@ -5,9 +5,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::slurm_api::{job_state_of, slurm_val_to_string, SlurmController};
+use crate::slurm_api::{job_state_of, slurm_val_to_f64, slurm_val_to_string, SlurmController};
 use crate::theme;
-use crate::validators::{parse_rss_to_pct, parse_cpu_pct};
+use crate::validators::{format_hms, parse_rss_to_pct, parse_cpu_pct};
 
 const METRICS_ROLLING_WINDOW: usize = 60;
 const MEMORY_FALLBACK_MB: u64 = 64_000;
@@ -134,66 +134,45 @@ impl InspectorState {
         if s.is_empty() { default.to_string() } else { s }
     }
 
-    /// Return a time field formatted as HH:MM:SS.
-    /// Slurm encodes `time_limit` in minutes and `run_time` in seconds
-    /// inside `{"number": N, ...}` objects, plain numbers, or strings.
+    /// Return a time field formatted as HH:MM:SS. Slurm encodes `time_limit`
+    /// in minutes and `run_time` in seconds; both may arrive wrapped, plain,
+    /// or as an already-formatted string.
     fn get_time_str(&self, key: &str, in_minutes: bool) -> String {
         let Some(val) = self.details.as_ref().and_then(|d| d.get(key)) else {
             return "N/A".to_string();
         };
-        let secs = match val {
-            serde_json::Value::Object(map) => {
-                if map.get("infinite").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    return "UNLIMITED".to_string();
-                }
-                let n = map.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
-                if in_minutes { n * 60 } else { n }
+        // An already-formatted duration ("01:30:00") passes through untouched.
+        if let Some(s) = val.as_str() {
+            if s.contains(':') {
+                return s.to_string();
             }
-            serde_json::Value::Number(n) => {
-                let n = n.as_i64().unwrap_or(0);
-                if in_minutes { n * 60 } else { n }
-            }
-            serde_json::Value::String(s) => {
-                // Already formatted time string like "01:30:00" — return as-is
-                if s.contains(':') {
-                    return s.clone();
-                }
-                // Numeric string
-                match s.parse::<i64>() {
-                    Ok(n) => if in_minutes { n * 60 } else { n },
-                    Err(_) => return s.clone(),
-                }
-            }
-            _ => return "N/A".to_string(),
-        };
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        let s = secs % 60;
-        format!("{h:02}:{m:02}:{s:02}")
+        }
+        let text = slurm_val_to_string(val);
+        if text == "UNLIMITED" {
+            return text;
+        }
+        match slurm_val_to_f64(val) {
+            Some(n) => format_hms(if in_minutes { n as i64 * 60 } else { n as i64 }),
+            None if text.is_empty() => "N/A".to_string(),
+            None => text,
+        }
     }
 
-    /// Return a memory field formatted as MB or GB.
-    /// Slurm encodes memory in MB inside `{"number": N, ...}` objects,
-    /// plain numbers, or numeric strings.
+    /// Return a memory field (MiB in Slurm's JSON) formatted as MiB or GiB.
     fn get_mem_str(&self, key: &str) -> String {
-        let Some(val) = self.details.as_ref().and_then(|d| d.get(key)) else {
-            return "N/A".to_string();
-        };
-        let mb = match val {
-            serde_json::Value::Object(map) => {
-                map.get("number").and_then(|v| v.as_i64()).unwrap_or(0)
-            }
-            serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
-            serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
-            _ => return "N/A".to_string(),
-        };
-        if mb == 0 {
+        let mib = self
+            .details
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(slurm_val_to_f64)
+            .unwrap_or(0.0);
+        if mib <= 0.0 {
             return "N/A".to_string();
         }
-        if mb >= 1024 {
-            format!("{:.1} GB", mb as f64 / 1024.0)
+        if mib >= 1024.0 {
+            format!("{:.1} GiB", mib / 1024.0)
         } else {
-            format!("{mb} MB")
+            format!("{mib:.0} MiB")
         }
     }
 
@@ -259,24 +238,15 @@ impl InspectorState {
             None => return,
         };
 
-        let total_mem_mb: i64 = details.get("minimum_memory_per_node")
-            .and_then(|v| {
-                if let Some(obj) = v.as_object() {
-                    obj.get("number").and_then(|n| n.as_i64())
-                } else {
-                    v.as_i64()
-                }
-            })
+        let total_mem_mb = details
+            .get("minimum_memory_per_node")
+            .and_then(slurm_val_to_f64)
+            .map(|m| m as i64)
             .unwrap_or(MEMORY_FALLBACK_MB as i64);
 
-        let run_time: f64 = details.get("run_time")
-            .and_then(|v| {
-                if let Some(obj) = v.as_object() {
-                    obj.get("number").and_then(|n| n.as_f64())
-                } else {
-                    v.as_f64()
-                }
-            })
+        let run_time = details
+            .get("run_time")
+            .and_then(slurm_val_to_f64)
             .unwrap_or(0.0);
 
         let cpu_val = parse_cpu_pct(&sstat.avg_cpu, run_time);
@@ -402,16 +372,11 @@ impl InspectorState {
                     SubTab::Metrics => SubTab::Overview,
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.sub_tab == SubTab::Logs && self.log_scroll + 1 < self.log_lines.len() {
-                    self.log_scroll += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j') if self.sub_tab == SubTab::Logs => {
+                self.scroll_logs_down();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.sub_tab == SubTab::Logs {
-                    self.log_scroll = self.log_scroll.saturating_sub(1);
-                    self.log_follow = false;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.sub_tab == SubTab::Logs => {
+                self.scroll_logs_up();
             }
             _ => {}
         }

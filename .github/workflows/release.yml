@@ -1,4 +1,5 @@
 name: Release
+
 on:
   push:
     tags: ["v*"]
@@ -7,8 +8,34 @@ permissions:
   contents: write
 
 jobs:
+  # Refuse to publish a tag whose version disagrees with the manifests, or
+  # that has no changelog entry — both are silent-wrong-release failure modes.
+  verify:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches manifests and changelog
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PY_VERSION=$(sed -n '/^\[project\]/,/^\[/s/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+
+          echo "tag=$VERSION cargo=$CARGO_VERSION pyproject=$PY_VERSION"
+          [ "$VERSION" = "$CARGO_VERSION" ] || { echo "::error::tag $VERSION != Cargo.toml $CARGO_VERSION"; exit 1; }
+          [ "$VERSION" = "$PY_VERSION" ]    || { echo "::error::tag $VERSION != pyproject.toml $PY_VERSION"; exit 1; }
+          grep -q "^## \[${VERSION}\]" CHANGELOG.md || { echo "::error::no CHANGELOG.md entry for $VERSION"; exit 1; }
+
+  # Same clippy/test/build gate as every push — a red build must not ship.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   build-wheels:
+    needs: [verify, ci]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -41,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write # trusted publishing; no API token needed
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -51,16 +78,19 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   publish-crates:
+    needs: [verify, ci]
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - run: cargo publish --allow-dirty
+      - uses: dtolnay/rust-toolchain@stable
+      # Cargo.lock is committed and in sync with the version bump, so the
+      # working tree stays clean during the verify build — no --allow-dirty.
+      - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   github-release:
-    needs: build-wheels
+    needs: [build-wheels, publish-pypi, publish-crates]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

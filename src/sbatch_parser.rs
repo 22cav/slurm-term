@@ -1,28 +1,39 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// Maps #SBATCH long keys to form state keys.
-fn directive_map() -> HashMap<&'static str, &'static str> {
-    let mut m = HashMap::new();
-    m.insert("job-name", "name");
-    m.insert("J", "name");
-    m.insert("partition", "partition");
-    m.insert("p", "partition");
-    m.insert("time", "time");
-    m.insert("t", "time");
-    m.insert("nodes", "nodes");
-    m.insert("N", "nodes");
-    m.insert("ntasks-per-node", "ntasks");
-    m.insert("cpus-per-task", "cpus");
-    m.insert("c", "cpus");
-    m.insert("mem", "memory");
-    m.insert("output", "output");
-    m.insert("o", "output");
-    m.insert("error", "error");
-    m.insert("e", "error");
-    m
-}
+/// Maps #SBATCH directive names (long and short) to form state keys.
+static DIRECTIVE_MAP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("job-name", "name"),
+        ("J", "name"),
+        ("partition", "partition"),
+        ("p", "partition"),
+        ("time", "time"),
+        ("t", "time"),
+        ("nodes", "nodes"),
+        ("N", "nodes"),
+        ("ntasks-per-node", "ntasks"),
+        ("cpus-per-task", "cpus"),
+        ("c", "cpus"),
+        ("mem", "memory"),
+        ("output", "output"),
+        ("o", "output"),
+        ("error", "error"),
+        ("e", "error"),
+    ])
+});
+
+static LONG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*#SBATCH\s+--([a-zA-Z][a-zA-Z0-9_-]*)(?:=|\s+)(.+)?$").unwrap()
+});
+static SHORT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*#SBATCH\s+-([a-zA-Z])(?:\s+(.+))?$").unwrap());
+static MODULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*module\s+load\s+(.+)$").unwrap());
+static EXPORT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*=.+)$").unwrap());
 
 const GPU_DIRECTIVES: &[&str] = &["gres", "gpus", "gpus-per-node", "G"];
 
@@ -30,12 +41,9 @@ const GPU_DIRECTIVES: &[&str] = &["gres", "gpus", "gpus-per-node", "G"];
 pub fn parse_sbatch_text(text: &str) -> HashMap<String, String> {
     // Normalize line endings: CRLF → LF, stray CR → LF
     let text = &text.replace("\r\n", "\n").replace('\r', "\n");
-    let dmap = directive_map();
-
-    let long_re = Regex::new(r"^\s*#SBATCH\s+--([a-zA-Z][a-zA-Z0-9_-]*)(?:=|\s+)(.+)?$").unwrap();
-    let short_re = Regex::new(r"^\s*#SBATCH\s+-([a-zA-Z])(?:\s+(.+))?$").unwrap();
-    let module_re = Regex::new(r"(?i)^\s*module\s+load\s+(.+)$").unwrap();
-    let export_re = Regex::new(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*=.+)$").unwrap();
+    let dmap = &*DIRECTIVE_MAP;
+    let (long_re, short_re, module_re, export_re) =
+        (&*LONG_RE, &*SHORT_RE, &*MODULE_RE, &*EXPORT_RE);
 
     let mut state: HashMap<String, String> = HashMap::new();
     state.insert("mode".into(), "sbatch".into());
@@ -64,13 +72,13 @@ pub fn parse_sbatch_text(text: &str) -> HashMap<String, String> {
             if let Some(caps) = long_re.captures(stripped) {
                 let key = caps.get(1).unwrap().as_str();
                 let value = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                apply_directive(key, value, &dmap, &mut state, &mut extra_directives);
+                apply_directive(key, value, dmap, &mut state, &mut extra_directives);
                 continue;
             }
             if let Some(caps) = short_re.captures(stripped) {
                 let key = caps.get(1).unwrap().as_str();
                 let value = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                apply_directive(key, value, &dmap, &mut state, &mut extra_directives);
+                apply_directive(key, value, dmap, &mut state, &mut extra_directives);
                 continue;
             }
             continue;

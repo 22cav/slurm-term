@@ -803,79 +803,46 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        let col = mouse.column;
-        let row = mouse.row;
+        let at = Position::new(mouse.column, mouse.row);
+        let in_content = self.content_area.contains(at);
 
         match mouse.kind {
             MouseEventKind::Moved => {
-                let r = self.hostname_rect;
-                self.show_hostname = col >= r.x && col < r.x + r.width
-                    && row >= r.y && row < r.y + r.height;
+                self.show_hostname = self.hostname_rect.contains(at);
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Check tab bar clicks
-                for &(tab, rect) in &self.tab_rects {
-                    if col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height {
-                        self.active_tab = tab;
-                        if tab == TabId::Composer && self.composer.partitions.is_empty() {
-                            self.composer.partitions = self.slurm.get_partitions();
-                        }
-                        return;
+                // Tab bar takes precedence over the content below it
+                if let Some(&(tab, _)) = self.tab_rects.iter().find(|(_, r)| r.contains(at)) {
+                    self.active_tab = tab;
+                    if tab == TabId::Composer && self.composer.partitions.is_empty() {
+                        self.composer.partitions = self.slurm.get_partitions();
                     }
+                    return;
                 }
-
-                // Delegate to content area
-                if col >= self.content_area.x
-                    && col < self.content_area.x + self.content_area.width
-                    && row >= self.content_area.y
-                    && row < self.content_area.y + self.content_area.height
-                {
-                    let rel_row = row.saturating_sub(self.content_area.y);
-                    let rel_col = col.saturating_sub(self.content_area.x);
+                if in_content {
+                    let rel_row = at.y.saturating_sub(self.content_area.y);
+                    let rel_col = at.x.saturating_sub(self.content_area.x);
+                    let area = self.content_area;
                     match self.active_tab {
-                        TabId::Monitor => {
-                            self.monitor.handle_mouse_click(rel_row, rel_col, &self.content_area);
-                        }
-                        TabId::Hardware => {
-                            self.hardware.handle_mouse_click(rel_row, rel_col, &self.content_area);
-                        }
-                        TabId::History => {
-                            self.history.handle_mouse_click(rel_row, rel_col, &self.content_area);
-                        }
-                        TabId::Composer => {
-                            self.composer.handle_mouse_click(rel_row, rel_col, &self.content_area);
-                        }
+                        TabId::Monitor => self.monitor.handle_mouse_click(rel_row, rel_col, &area),
+                        TabId::Hardware => self.hardware.handle_mouse_click(rel_row, rel_col, &area),
+                        TabId::History => self.history.handle_mouse_click(rel_row, rel_col, &area),
+                        TabId::Composer => self.composer.handle_mouse_click(rel_row, rel_col, &area),
                     }
                 }
             }
-            MouseEventKind::ScrollDown => {
-                if col >= self.content_area.x
-                    && col < self.content_area.x + self.content_area.width
-                    && row >= self.content_area.y
-                    && row < self.content_area.y + self.content_area.height
-                {
-                    match self.active_tab {
-                        TabId::Monitor => self.monitor.scroll_down(),
-                        TabId::Hardware => self.hardware.scroll_down(),
-                        TabId::History => self.history.scroll_down(),
-                        TabId::Composer => self.composer.scroll_down(),
-                    }
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                if col >= self.content_area.x
-                    && col < self.content_area.x + self.content_area.width
-                    && row >= self.content_area.y
-                    && row < self.content_area.y + self.content_area.height
-                {
-                    match self.active_tab {
-                        TabId::Monitor => self.monitor.scroll_up(),
-                        TabId::Hardware => self.hardware.scroll_up(),
-                        TabId::History => self.history.scroll_up(),
-                        TabId::Composer => self.composer.scroll_up(),
-                    }
-                }
-            }
+            MouseEventKind::ScrollDown if in_content => match self.active_tab {
+                TabId::Monitor => self.monitor.scroll_down(),
+                TabId::Hardware => self.hardware.scroll_down(),
+                TabId::History => self.history.scroll_down(),
+                TabId::Composer => self.composer.scroll_down(),
+            },
+            MouseEventKind::ScrollUp if in_content => match self.active_tab {
+                TabId::Monitor => self.monitor.scroll_up(),
+                TabId::Hardware => self.hardware.scroll_up(),
+                TabId::History => self.history.scroll_up(),
+                TabId::Composer => self.composer.scroll_up(),
+            },
             _ => {}
         }
     }

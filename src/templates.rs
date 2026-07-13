@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use regex::Regex;
+
+/// A template file name (kept filesystem-safe).
+static TEMPLATE_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$").unwrap());
 
 fn templates_dir() -> PathBuf {
     if let Ok(p) = std::env::var("SLURMTERM_TEMPLATES_DIR") {
@@ -18,8 +23,7 @@ fn sanitize_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("Template name must not be empty".into());
     }
-    let re = Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$").unwrap();
-    if !re.is_match(name) {
+    if !TEMPLATE_NAME_RE.is_match(name) {
         return Err(format!(
             "Invalid template name: {name:?} (only letters, digits, underscores, hyphens, spaces)"
         ));

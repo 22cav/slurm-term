@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7]
+
+### Fixed
+- **Crash after idle in the job inspector**: viewing a job's logs and leaving the TUI idle would panic and dump an error to the terminal once the job finished. The log buffer shrinks when the job's log path disappears, but the scroll offset was left pointing past the end, producing an out-of-bounds slice on the next redraw. The offset is now clamped on every log reload and again at render time.
+- **Crash in narrow terminals**: an unchecked subtraction in the header layout could underflow when the terminal was too narrow for the cluster/user/node banner.
+- **Live CPU and memory sparklines never appeared on real clusters**: modern Slurm reports `job_state` as an array (`["RUNNING"]`), but the inspector compared it as a plain string, so the state never matched `RUNNING` and `sstat` was never called. All JSON state reads now go through a shared helper that accepts both shapes.
+- **MaxRSS was always blank in History on real clusters**: `sacct` only populates `MaxRSS` on step rows (`123.batch`), which the parser discarded. Step rows are now folded into their parent job, carrying the maximum RSS across steps (unit-aware) and filling in `TotalCPU` when the job row omits it.
+- **Memory reported in the wrong unit**: the Cluster tab labelled columns `Mem(GB)`/`Free(GB)` while printing raw mebibytes from `sinfo %m` and `scontrol` `RealMemory`/`FreeMem`. Values are now converted and the columns read `Mem(GiB)`/`Free(GiB)`.
+- **Node and partition states were never colour-coded**: node states were matched in lowercase while `scontrol` reports them uppercase, and the partition `State` column was styled with `up`/`down` logic that belongs to the `Avail` column. Both now use a shared, case-insensitive mapping in which problem flags (`IDLE+DRAIN`) take precedence over the base state.
+- **`scontrol show nodes` parsing corrupted several fields**: the key/value regex truncated values containing spaces or `=` (`OS=`, multi-word `Reason=`, `CfgTRES=cpu=16,mem=64G`). Node data is now read from `--json` where available, with a corrected tokenizer as fallback.
+- **`--time` validation used the wrong unit**: a bare integer was treated as seconds, but `sbatch` interprets `--time=<n>` as minutes. The `days-hours` and `days-hours:minutes` forms were also mishandled.
+- **Incomplete job-state colours**: added the documented states that fell through to grey (`BOOT_FAIL`, `DEADLINE`, `REVOKED`, `REQUEUED`, `RESIZING`, `SIGNALING`, `STAGE_OUT`, `SPECIAL_EXIT`, `CONFIGURING`), and states are now matched on their first word so `sacct`'s `CANCELLED by <uid>` is coloured correctly.
+- **Storage view could mis-parse `df` output**: long device names wrap onto a second line with `df -h`, breaking the column parse. Now uses `df -hP`.
+
+### Added
+- **Interactive `srun` sessions actually launch `srun`**: submitting in `srun` mode previously built an interactive command in the preview but silently submitted a batch job instead. It now suspends the TUI, hands the terminal to `srun --pty … $SHELL`, and restores the interface when the session exits. `Ctrl+C` inside the session no longer kills slurm-term.
+- **Slurm errors are surfaced in the status bar**: failing commands previously produced silently empty views. Failures now appear in the status line, including a specific message when the cluster's Slurm is too old for `--json` (requires 20.11+).
+- **Command timeouts**: the configurable `subprocess_timeout` was accepted but never enforced, so a hung Slurm client could freeze the interface indefinitely. Commands are now killed at the deadline.
+- **GPU utilisation sparkline**: the previously inert `[gpu]` configuration is now wired up. When `enabled = true`, the inspector samples GPU utilisation on the job's first node. Off by default.
+- Test suite covering the log-scroll crash, Slurm output parsers, validators, and the command timeout.
+
+### Changed
+- Demo mode now emits the same JSON and `sacct`/`sstat` shapes as a real cluster, so it exercises the same code paths instead of masking format bugs.
+- Internal cleanup: consolidated duplicated duration formatting, Slurm JSON unwrapping, and mouse hit-testing; regexes are now compiled once instead of on every call (previously recompiled on every keystroke in the Composer). Zero clippy warnings under `-D warnings`.
+
 ## [0.1.6]
 
 ### Added

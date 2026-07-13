@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+use crate::validators::format_hms;
 
 // ---------------------------------------------------------------------------
 // JobInfo
@@ -85,10 +87,18 @@ pub struct StorageInfo {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
+/// Job ID, optionally an array element: "123" or "123_4".
+static JOB_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+(_\d+)?$").unwrap());
+/// An sbatch long-option name.
+static SAFE_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]*$").unwrap());
+/// A value safe to pass as a squeue/sacct filter argument.
+static SAFE_FILTER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_.@:+/-]+$").unwrap());
+
 fn validate_job_id(job_id: &str) -> Result<String, String> {
     let job_id = job_id.trim();
-    let re = Regex::new(r"^\d+(_\d+)?$").unwrap();
-    if !re.is_match(job_id) {
+    if !JOB_ID_RE.is_match(job_id) {
         return Err(format!("Invalid job ID: {job_id:?}"));
     }
     Ok(job_id.to_string())
@@ -104,16 +114,14 @@ fn validate_param_value(value: &str) -> Result<(), String> {
 }
 
 fn validate_safe_key(key: &str) -> Result<(), String> {
-    let re = Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]*$").unwrap();
-    if !re.is_match(key) {
+    if !SAFE_KEY_RE.is_match(key) {
         return Err(format!("Unsafe parameter key: {key:?}"));
     }
     Ok(())
 }
 
 fn validate_safe_filter(value: &str) -> Result<(), String> {
-    let re = Regex::new(r"^[a-zA-Z0-9_.@:+/-]+$").unwrap();
-    if !re.is_match(value) {
+    if !SAFE_FILTER_RE.is_match(value) {
         return Err(format!("Invalid filter value: {value:?}"));
     }
     Ok(())
@@ -530,7 +538,9 @@ impl SlurmController for RealSlurmController {
     }
 
     fn get_storage(&self) -> Vec<StorageInfo> {
-        let (rc, stdout, _) = self.run_cmd(&["df", "-h"], self.timeout_secs.min(10));
+        // -P (POSIX) keeps each filesystem on a single line; plain `df -h`
+        // wraps long device names, which breaks the positional parse below.
+        let (rc, stdout, _) = self.run_cmd(&["df", "-hP"], self.timeout_secs.min(10));
         if rc != 0 {
             return Vec::new();
         }
@@ -630,6 +640,18 @@ pub fn slurm_val_to_string(val: &serde_json::Value) -> String {
     }
 }
 
+/// Numeric value of a Slurm JSON field, unwrapping the modern
+/// `{"number": N, "set": b, "infinite": b}` envelope as well as plain numbers
+/// and numeric strings. Returns None when the field is absent or non-numeric.
+pub fn slurm_val_to_f64(val: &serde_json::Value) -> Option<f64> {
+    match val {
+        serde_json::Value::Object(map) => map.get("number").and_then(slurm_val_to_f64),
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 /// First hostname of a Slurm node list expression:
 /// "gpu[001-008,010],cpu01" -> "gpu001", "node01,node02" -> "node01".
 pub fn first_node_of(node_list: &str) -> Option<String> {
@@ -679,10 +701,7 @@ fn parse_job_entry(entry: &serde_json::Value) -> JobInfo {
                 .get("elapsed")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let h = elapsed / 3600;
-            let m = (elapsed % 3600) / 60;
-            let s = elapsed % 60;
-            format!("{h:02}:{m:02}:{s:02}")
+            format_hms(elapsed)
         }
         Some(v) => v.to_string().trim_matches('"').to_string(),
         None => String::new(),
@@ -690,57 +709,33 @@ fn parse_job_entry(entry: &serde_json::Value) -> JobInfo {
 
     let state = job_state_of(entry);
 
-    let node_count = match entry.get("node_count") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => String::new(),
+    // Every scalar field goes through slurm_val_to_string, which unwraps the
+    // modern {"number":N,"set":b,"infinite":b} envelope and plain values alike.
+    let get = |key: &str| -> String {
+        entry.get(key).map(slurm_val_to_string).unwrap_or_default()
     };
 
-    let submit_time = match entry.get("submit_time") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => String::new(),
-    };
-
-    let get_str = |key: &str| -> String {
-        entry
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let get_str_or = |key: &str| -> String {
-        match entry.get(key) {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(v) => v.to_string().trim_matches('"').to_string(),
-            None => String::new(),
-        }
-    };
+    let node_count = get("node_count");
+    let node_list = get("nodes");
 
     JobInfo {
-        job_id: get_str_or("job_id"),
-        name: get_str("name"),
-        partition: get_str("partition"),
+        job_id: get("job_id"),
+        name: get("name"),
+        partition: get("partition"),
         state,
         time_used,
         nodes: if node_count.is_empty() {
-            get_str_or("nodes")
+            node_list.clone()
         } else {
             node_count
         },
-        reason: get_str_or("state_reason"),
-        user: get_str("user_name"),
-        work_dir: get_str("working_directory"),
-        stdout_path: get_str("standard_output"),
-        stderr_path: get_str("standard_error"),
-        submit_time,
-        node_list: get_str_or("nodes"),
+        reason: get("state_reason"),
+        user: get("user_name"),
+        work_dir: get("working_directory"),
+        stdout_path: get("standard_output"),
+        stderr_path: get("standard_error"),
+        submit_time: get("submit_time"),
+        node_list,
         extra: HashMap::new(),
     }
 }
@@ -924,91 +919,47 @@ pub fn extract_form_state(details: &serde_json::Value) -> HashMap<String, String
     let mut state = HashMap::new();
     state.insert("mode".into(), "sbatch".into());
 
-    let get_str = |key: &str| -> String {
-        details
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+    let get = |key: &str| -> String {
+        details.get(key).map(slurm_val_to_string).unwrap_or_default()
     };
 
-    state.insert("name".into(), get_str("name"));
-    state.insert("partition".into(), get_str("partition"));
+    state.insert("name".into(), get("name"));
+    state.insert("partition".into(), get("partition"));
 
-    // Time limit (minutes -> HH:MM:SS)
-    let tl = match details.get("time_limit") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        Some(v) => v.as_i64().unwrap_or(0),
-        None => 0,
-    };
+    // Slurm reports time_limit in minutes; the form wants HH:MM:SS.
+    let tl: i64 = get("time_limit").parse().unwrap_or(0);
     if tl > 0 {
-        let total_sec = tl * 60;
-        let h = total_sec / 3600;
-        let m = (total_sec % 3600) / 60;
-        let s = total_sec % 60;
-        state.insert("time".into(), format!("{h:02}:{m:02}:{s:02}"));
+        state.insert("time".into(), format_hms(tl * 60));
     }
 
-    let nodes = match details.get("node_count") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or("1".into()),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => "1".into(),
-    };
-    state.insert("nodes".into(), nodes);
+    let nodes = get("node_count");
+    state.insert(
+        "nodes".into(),
+        if nodes.is_empty() { "1".into() } else { nodes },
+    );
+    state.insert("ntasks".into(), get("tasks_per_node"));
+    state.insert("cpus".into(), get("cpus_per_task"));
 
-    let ntasks = match details.get("tasks_per_node") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => String::new(),
-    };
-    state.insert("ntasks".into(), ntasks);
-
-    let cpus = match details.get("cpus_per_task") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => String::new(),
-    };
-    state.insert("cpus".into(), cpus);
-
-    let mem = match details.get("minimum_memory_per_node") {
-        Some(serde_json::Value::Object(map)) => map
-            .get("number")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => String::new(),
-    };
-    if !mem.is_empty() {
-        if let Ok(mb) = mem.parse::<f64>() {
-            let gb = mb / 1024.0;
-            if gb >= 1.0 {
-                state.insert("memory".into(), format!("{gb:.0}G"));
-            } else {
-                state.insert("memory".into(), format!("{mem}M"));
-            }
-        }
+    // minimum_memory_per_node is in MiB; show whole GiB when it divides evenly.
+    let mem = get("minimum_memory_per_node");
+    if let Ok(mb) = mem.parse::<f64>() {
+        let gb = mb / 1024.0;
+        let value = if gb >= 1.0 {
+            format!("{gb:.0}G")
+        } else {
+            format!("{mem}M")
+        };
+        state.insert("memory".into(), value);
     }
 
-    let gres = get_str("gres_detail");
-    if !gres.is_empty() && gres != "(null)" && gres != "[]" {
+    let gres = get("gres_detail");
+    if !gres.is_empty() && gres != "[]" {
         state.insert("gpus".into(), gres);
     }
 
-    state.insert("script".into(), get_str("command"));
-    state.insert("output".into(), get_str("standard_output"));
-    state.insert("error".into(), get_str("standard_error"));
+    state.insert("script".into(), get("command"));
+    state.insert("output".into(), get("standard_output"));
+    state.insert("error".into(), get("standard_error"));
 
     state
 }
@@ -1062,6 +1013,46 @@ mod tests {
         );
         let msg = ctl.take_last_error().unwrap();
         assert!(msg.contains("--json unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_form_state_reads_modern_wrapped_scalars() {
+        let details = serde_json::json!({
+            "name": "train",
+            "partition": "gpu",
+            "time_limit": {"set": true, "infinite": false, "number": 90},
+            "node_count": {"set": true, "infinite": false, "number": 2},
+            "cpus_per_task": {"set": true, "infinite": false, "number": 8},
+            "minimum_memory_per_node": {"set": true, "infinite": false, "number": 32768},
+            "gres_detail": "gpu:a100:2",
+            "command": "/home/me/train.sh",
+            "standard_output": "out.log",
+        });
+        let s = extract_form_state(&details);
+        assert_eq!(s["name"], "train");
+        assert_eq!(s["time"], "01:30:00"); // 90 minutes
+        assert_eq!(s["nodes"], "2");
+        assert_eq!(s["cpus"], "8");
+        assert_eq!(s["memory"], "32G");
+        assert_eq!(s["gpus"], "gpu:a100:2");
+        assert_eq!(s["script"], "/home/me/train.sh");
+    }
+
+    #[test]
+    fn extract_form_state_handles_legacy_and_missing_fields() {
+        // Legacy plain scalars, and a "(null)" gres that must not leak through
+        let details = serde_json::json!({
+            "name": "old",
+            "time_limit": 60,
+            "cpus_per_task": 4,
+            "gres_detail": "(null)",
+        });
+        let s = extract_form_state(&details);
+        assert_eq!(s["time"], "01:00:00");
+        assert_eq!(s["cpus"], "4");
+        assert_eq!(s["nodes"], "1"); // defaulted
+        assert!(!s.contains_key("gpus"));
+        assert!(!s.contains_key("memory"));
     }
 
     #[test]

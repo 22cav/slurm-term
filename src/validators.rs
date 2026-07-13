@@ -1,4 +1,13 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
+
+/// A memory size like "4G", "512M", "1024".
+static MEMORY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(\d+)\s*([KMGT]?)B?\s*$").unwrap());
+/// A Slurm job name.
+static JOB_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.@:+/-]*$").unwrap());
 
 /// Parse a Slurm `--time` string and return total seconds.
 ///
@@ -43,10 +52,17 @@ pub fn parse_time(time_str: &str) -> Result<i64, String> {
     Ok(days.unwrap_or(0) * 86400 + secs)
 }
 
+/// Format a duration in seconds as Slurm's HH:MM:SS.
+pub fn format_hms(total_secs: i64) -> String {
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 /// Parse a memory string like "4G" into megabytes.
 pub fn parse_memory(mem_str: &str) -> Result<i64, String> {
-    let re = Regex::new(r"(?i)^\s*(\d+)\s*([KMGT]?)B?\s*$").unwrap();
-    let caps = re
+    let caps = MEMORY_RE
         .captures(mem_str)
         .ok_or_else(|| format!("Invalid memory format: {mem_str:?}"))?;
     let value: i64 = caps[1]
@@ -72,8 +88,7 @@ pub fn validate_job_name(name: &str) -> Result<String, String> {
     if name.len() > 200 {
         return Err("Job name too long (max 200 chars)".into());
     }
-    let re = Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.@:+/-]*$").unwrap();
-    if !re.is_match(name) {
+    if !JOB_NAME_RE.is_match(name) {
         return Err(
             "Job name contains invalid characters (use letters, digits, dots, underscores, @, colons, +, /, hyphens)"
                 .into(),
