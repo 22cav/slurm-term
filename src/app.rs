@@ -1,7 +1,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste, EnableFocusChange, DisableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use ratatui::prelude::*;
@@ -77,6 +77,11 @@ pub struct App {
     last_area: Rect,
     hostname_rect: Rect,
     show_hostname: bool,
+
+    // Request a full terminal clear + repaint on the next loop iteration.
+    // Recovers from terminal-side screen clears (e.g. ⌘K in Terminal.app),
+    // which wipe cells underneath ratatui's diff-based renderer.
+    needs_redraw: bool,
 }
 
 pub struct ConfirmDialog {
@@ -96,13 +101,13 @@ impl App {
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
             let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
             original_hook(panic_info);
         }));
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -145,6 +150,7 @@ impl App {
             last_area: Rect::default(),
             hostname_rect: Rect::default(),
             show_hostname: false,
+            needs_redraw: false,
         };
 
         // Initial data fetch
@@ -166,6 +172,7 @@ impl App {
 
         let tick_rate = Duration::from_millis(250);
         let mut last_poll = Instant::now();
+        let mut last_tick = Instant::now();
         let mut last_inspector_poll = Instant::now();
         let mut mouse_captured = true;
 
@@ -184,17 +191,36 @@ impl App {
 
             terminal.draw(|f| app.draw(f))?;
 
+            // Block for up to one render tick waiting for input. The data poll
+            // below is keyed off `last_poll` (seconds apart); tying the event
+            // timeout to it instead would busy-spin once the tick elapsed.
             let timeout = tick_rate
-                .checked_sub(last_poll.elapsed())
+                .checked_sub(last_tick.elapsed())
                 .unwrap_or(Duration::ZERO);
 
             if event::poll(timeout)? {
                 match event::read()? {
-                    Event::Key(key) => app.handle_key(key),
+                    // Only act on key press/repeat. Windows and terminals with
+                    // the enhanced keyboard protocol also emit Release events;
+                    // without this guard every keystroke would fire twice.
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        app.handle_key(key)
+                    }
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
                     Event::Paste(text) => app.handle_paste(&text),
+                    // Regaining focus repaints from scratch: the terminal may
+                    // have cleared its buffer while we were away (⌘K).
+                    Event::FocusGained => app.needs_redraw = true,
                     _ => {}
                 }
+            }
+
+            if app.needs_redraw {
+                terminal.clear()?;
+                app.needs_redraw = false;
+            }
+            if last_tick.elapsed() >= tick_rate {
+                last_tick = Instant::now();
             }
 
             // Interactive srun handover requested by the Composer
@@ -249,7 +275,7 @@ impl App {
         }
 
         terminal::disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange)?;
         Ok(())
     }
 
@@ -267,7 +293,8 @@ impl App {
             terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture,
-            DisableBracketedPaste
+            DisableBracketedPaste,
+            DisableFocusChange
         )?;
         println!("Starting interactive session: {}", args.join(" "));
         println!("(waiting for allocation — exit the shell to return to slurm-term)");
@@ -293,7 +320,8 @@ impl App {
             terminal.backend_mut(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableFocusChange
         )?;
         // Force a full repaint — the shell overwrote the whole screen.
         terminal.clear()?;
@@ -321,7 +349,7 @@ impl App {
             self.composer.partitions = self.slurm.get_partitions();
         }
         // Ensure preview text is initialized
-        if self.composer.preview_text.is_empty() {
+        if self.composer.preview_is_empty() {
             self.composer.sync_preview_from_form();
         }
     }
@@ -407,7 +435,8 @@ impl App {
             node_tag.to_string()
         };
         let right_text = format!("  {} │ {} │ {} ", self.cluster_name, self.user, node_display);
-        let right_len = right_text.len() as u16;
+        // Count columns, not bytes: '│' is 3 bytes but one cell wide.
+        let right_len = right_text.chars().count() as u16;
         let pad = chunks[0].width.saturating_sub(x_offset + right_len);
         tab_spans.push(Span::styled(" ".repeat(pad as usize), Style::default()));
         tab_spans.push(Span::styled(
@@ -415,7 +444,7 @@ impl App {
             Style::default().fg(theme::MUTED),
         ));
         let node_color = if is_login { theme::GREEN } else { theme::YELLOW };
-        let node_span_len = node_display.len() as u16 + 1; // +1 for trailing space
+        let node_span_len = node_display.chars().count() as u16 + 1; // +1 for trailing space
         let node_x = (chunks[0].x + chunks[0].width).saturating_sub(node_span_len);
         self.hostname_rect = Rect::new(node_x, chunks[0].y, node_span_len, 1);
         tab_spans.push(Span::styled(
@@ -449,11 +478,13 @@ impl App {
         };
 
         let help_spans = self.help_spans();
-        let status_span = Span::styled(format!(" {status_text}"), Style::default().fg(theme::DIM));
+        // Errors (prefixed "!") stand out in red; normal status stays dim.
+        let status_color = if status_text.starts_with('!') { theme::RED } else { theme::DIM };
+        let status_span = Span::styled(format!(" {status_text}"), Style::default().fg(status_color));
 
         let mut bottom_spans = vec![status_span];
-        // Calculate remaining width for right-aligned help
-        let status_len = status_text.len() as u16 + 1;
+        // Calculate remaining width for right-aligned help (columns, not bytes)
+        let status_len = status_text.chars().count() as u16 + 1;
         let help_text_len: u16 = help_spans.iter().map(|s| s.width() as u16).sum();
         let gap = chunks[2].width.saturating_sub(status_len + help_text_len + 1);
         bottom_spans.push(Span::styled(" ".repeat(gap as usize), Style::default()));
@@ -523,20 +554,40 @@ impl App {
                         key("Enter"), desc("Inspect"), sep(),
                         key("Space"), desc("Select"), sep(),
                         key("s"), desc("Sort"), sep(),
-                        key("k"), desc("Kill"), sep(),
+                        key("h/u"), desc("Hold/Release"), sep(),
+                        key("x"), desc("Kill"), sep(),
                         key("r"), desc("Refresh"),
                     ]);
                 }
             }
             TabId::Composer => {
-                if self.composer.active_pane == composer::Pane::Preview && self.composer.editing {
+                if self.composer.field_editor_open() {
+                    // Modules/Env/Init popup: text editor, Esc saves and closes.
                     spans.extend(vec![
-                        key("Esc"), desc("Stop"), sep(),
+                        key("Esc"), desc("Done"), sep(),
+                        key("^U"), desc("Undo"), sep(),
                         key("^K"), desc("Kill Line"), sep(),
-                        key("^D"), desc("Del Line"), sep(),
-                        key("^A/^E"), desc("Home/End"), sep(),
+                        key("^W"), desc("Del Word"), sep(),
+                        key("Enter"), desc("Newline"),
+                    ]);
+                } else if self.composer.active_pane == composer::Pane::Preview
+                    && self.composer.editing
+                {
+                    spans.extend(vec![
+                        key("Esc"), desc("Done"), sep(),
+                        key("^U"), desc("Undo"), sep(),
+                        key("^K"), desc("Kill Line"), sep(),
                         key("^W"), desc("Del Word"), sep(),
                         key("^S"), desc("Submit"),
+                    ]);
+                } else if self.composer.editing {
+                    // Inline single-line field editing
+                    spans.extend(vec![
+                        key("Esc"), desc("Done"), sep(),
+                        key("Enter"), desc("Next Field"), sep(),
+                        key("^U"), desc("Undo"), sep(),
+                        key("^K"), desc("Kill Line"), sep(),
+                        key("^A/^E"), desc("Home/End"),
                     ]);
                 } else {
                     spans.extend(vec![
@@ -545,7 +596,7 @@ impl App {
                         key("?"), desc("Help"), sep(),
                         key("a"), desc("Add Param"), sep(),
                         key("^O"), desc("Browse"), sep(),
-                        key("^Y"), desc("Copy"), sep(),
+                        key("^G"), desc("Copy"), sep(),
                         key("^S"), desc("Submit"),
                     ]);
                 }
@@ -567,7 +618,13 @@ impl App {
             }
         }
 
-        spans.extend(vec![sep(), key("q"), desc("Quit")]);
+        // While text input is active, `q` types a character — only Ctrl+C
+        // quits. Advertise whichever actually works in the current state.
+        if self.is_text_input_active() {
+            spans.extend(vec![sep(), key("^C"), desc("Quit")]);
+        } else {
+            spans.extend(vec![sep(), key("q"), desc("Quit")]);
+        }
         spans
     }
 
@@ -601,6 +658,11 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // On macOS the Command key (⌘) arrives as SUPER on terminals that
+        // forward it. Treat it as an alias for Control so ⌘-shortcuts match the
+        // documented ⌃ ones instead of leaking through as typed characters.
+        let key = normalize_cmd(key);
+
         // Confirm dialog takes priority
         if self.confirm.is_some() {
             match key.code {
@@ -618,6 +680,13 @@ impl App {
 
         // Global keys
         match key.code {
+            // F5: force a full repaint and refresh data. Works in every mode —
+            // it's the recovery key when the terminal cleared its own screen.
+            KeyCode::F(5) => {
+                self.needs_redraw = true;
+                self.poll_active_tab();
+                return;
+            }
             // Ctrl+C always quits
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -740,7 +809,7 @@ impl App {
                                 self.active_tab = TabId::Monitor;
                                 self.monitor.poll(&*self.slurm);
                             }
-                            Err(e) => self.set_status(&format!("Submit failed: {e}")),
+                            Err(e) => self.set_status(&format!("! Submit failed: {e}")),
                         }
                     }
                     composer::Action::RunInteractive(args) => {
@@ -784,7 +853,8 @@ impl App {
 
     fn is_text_input_active(&self) -> bool {
         match self.active_tab {
-            TabId::Monitor => self.monitor.search_active || self.monitor.inspector.is_some(),
+            // The inspector has no text entry, so it must not swallow q / 1-4.
+            TabId::Monitor => self.monitor.search_active,
             TabId::Composer => {
                 self.composer.editing
                     || self.composer.template_dialog.is_some()
@@ -848,6 +918,19 @@ impl App {
     }
 }
 
+/// Map the macOS Command key (reported as SUPER) onto Control, so ⌘ and ⌃ are
+/// interchangeable throughout the app. Keys without SUPER are returned as-is;
+/// combinations that already carry Control are left untouched.
+fn normalize_cmd(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        key.modifiers.remove(KeyModifiers::SUPER);
+        key.modifiers.insert(KeyModifiers::CONTROL);
+    }
+    key
+}
+
 pub fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let popup_width = area.width * percent_x / 100;
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -858,4 +941,25 @@ pub fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         popup_width.min(area.width),
         height.min(area.height),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_key_is_aliased_to_control() {
+        let cmd_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::SUPER);
+        let n = normalize_cmd(cmd_s);
+        assert!(n.modifiers.contains(KeyModifiers::CONTROL));
+        assert!(!n.modifiers.contains(KeyModifiers::SUPER));
+    }
+
+    #[test]
+    fn plain_and_control_keys_are_unchanged() {
+        let plain = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(normalize_cmd(plain).modifiers, KeyModifiers::NONE);
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(normalize_cmd(ctrl_s).modifiers, KeyModifiers::CONTROL);
+    }
 }

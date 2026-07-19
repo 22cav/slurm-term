@@ -4,6 +4,7 @@ use ratatui::widgets::*;
 
 use crate::slurm_api::{SacctRow, SlurmController};
 use crate::theme;
+use crate::validators::{cmp_duration, cmp_numeric};
 
 pub enum Action {
     None,
@@ -53,13 +54,15 @@ pub struct HistoryState {
 
 impl HistoryState {
     pub fn new(since_days: u32) -> Self {
+        // Snap to the nearest window that covers the requested span, then keep
+        // since_days consistent with the highlighted selector entry.
         let time_idx = TIME_WINDOWS
             .iter()
-            .position(|&(d, _)| d == since_days)
-            .unwrap_or(0);
+            .position(|&(d, _)| d >= since_days)
+            .unwrap_or(TIME_WINDOWS.len() - 1);
         Self {
             rows: Vec::new(),
-            since_days,
+            since_days: TIME_WINDOWS[time_idx].0,
             time_idx,
             table_state: TableState::default(),
             sort_col: SortCol::JobId,
@@ -72,21 +75,24 @@ impl HistoryState {
         self.rows = slurm.get_sacct(None, Some(&start));
     }
 
-    fn sorted_rows(&self) -> Vec<&SacctRow> {
-        let mut sorted: Vec<&SacctRow> = self.rows.iter().collect();
+    /// Row indices into `self.rows` in the current sort order. Returns owned
+    /// indices (no borrow of self) so `draw` can still take `&mut table_state`.
+    fn sorted_indices(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
         let asc = self.sort_asc;
-        sorted.sort_by(|a, b| {
+        order.sort_by(|&a, &b| {
+            let (a, b) = (&self.rows[a], &self.rows[b]);
             let ord = match self.sort_col {
-                SortCol::JobId => a.job_id.cmp(&b.job_id),
+                SortCol::JobId => cmp_numeric(&a.job_id, &b.job_id),
                 SortCol::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortCol::Partition => a.partition.cmp(&b.partition),
                 SortCol::State => a.state.cmp(&b.state),
-                SortCol::Elapsed => a.elapsed.cmp(&b.elapsed),
-                SortCol::Exit => a.exit_code.cmp(&b.exit_code),
+                SortCol::Elapsed => cmp_duration(&a.elapsed, &b.elapsed),
+                SortCol::Exit => cmp_numeric(&a.exit_code, &b.exit_code),
             };
             if asc { ord } else { ord.reverse() }
         });
-        sorted
+        order
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, _slurm: &dyn SlurmController) -> Action {
@@ -106,9 +112,9 @@ impl HistoryState {
             }
             KeyCode::Enter => {
                 if let Some(i) = self.table_state.selected() {
-                    let sorted = self.sorted_rows();
-                    if let Some(row) = sorted.get(i) {
-                        return Action::Inspect(row.job_id.clone());
+                    let order = self.sorted_indices();
+                    if let Some(&idx) = order.get(i) {
+                        return Action::Inspect(self.rows[idx].job_id.clone());
                     }
                 }
                 Action::None
@@ -194,23 +200,8 @@ impl HistoryState {
         ])
         .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD));
 
-        let mut indices: Vec<usize> = (0..self.rows.len()).collect();
-        let asc = self.sort_asc;
-        indices.sort_by(|&a, &b| {
-            let ra = &self.rows[a];
-            let rb = &self.rows[b];
-            let ord = match self.sort_col {
-                SortCol::JobId => ra.job_id.cmp(&rb.job_id),
-                SortCol::Name => ra.name.to_lowercase().cmp(&rb.name.to_lowercase()),
-                SortCol::Partition => ra.partition.cmp(&rb.partition),
-                SortCol::State => ra.state.cmp(&rb.state),
-                SortCol::Elapsed => ra.elapsed.cmp(&rb.elapsed),
-                SortCol::Exit => ra.exit_code.cmp(&rb.exit_code),
-            };
-            if asc { ord } else { ord.reverse() }
-        });
-
-        let rows: Vec<Row> = indices
+        let order = self.sorted_indices();
+        let rows: Vec<Row> = order
             .iter()
             .map(|&i| {
                 let r = &self.rows[i];
@@ -253,7 +244,7 @@ impl HistoryState {
     pub fn handle_mouse_click(&mut self, row: u16, _col: u16, _area: &Rect) {
         // Row 0 = time window selector, row 1 = table header, data starts at row 2
         if row >= 2 {
-            let idx = (row - 2) as usize;
+            let idx = self.table_state.offset() + (row - 2) as usize;
             if idx < self.rows.len() {
                 self.table_state.select(Some(idx));
             }

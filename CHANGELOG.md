@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8]
+
+### Fixed
+- **Recovery from terminal-side screen clears (`⌘K`)**: `⌘K` in Terminal.app/iTerm2 clears the terminal's own buffer underneath the interface, which a diff-based renderer cannot detect — the display looked destroyed. The interface now repaints fully when the terminal regains focus, and `F5` forces a repaint + data refresh from any mode.
+- **Editing keys now work in every field, not just the multiline editors**: single-line form fields (name, time, memory, …) ran on a leftover hand-rolled editor without `Ctrl+K`/`Ctrl+A`/`Ctrl+E`/undo. All text entry now runs through the same `tui-textarea` engine, with per-state help bars (the form-field editing state previously showed navigation hints, hiding how to exit).
+- **Typed text can no longer be silently lost**: in-progress edits are committed on every exit path — `Esc`, `Enter`, `Tab`, mouse click, `Ctrl+S`, `Ctrl+T`. Clicking from a modified preview into the form now applies the preview edits instead of discarding them; clicking away from the Modules/Env/Init popup saves it.
+- **`Esc` in the preview pane returns to the form**, making `Esc` a consistent "step out" key throughout the Composer.
+- **The quit hint in the help bar is now state-aware**: while typing in any editor or search field, `q` inserts a character rather than quitting, so the bar shows `^C Quit` there and `q Quit` only when `q` actually quits.
+- **macOS Command key mishandled**: on terminals that forward it, `⌘` arrives as the `SUPER` modifier, which the app didn't recognise — `⌘S` and friends did nothing and, inside the editor, leaked through as a typed character. `⌘` is now treated as an alias for `Control` everywhere, so `⌘`/`⌃` shortcuts are interchangeable. (Note: terminals such as Terminal.app that never forward `⌘` still require `Control`.)
+- **Every keystroke could fire twice**: key events weren't filtered by kind, so on Windows and on terminals using the enhanced keyboard protocol the release event re-triggered each action. Only press/repeat events are handled now.
+- **100% CPU while idle**: the event-loop timeout was derived from the multi-second data-poll timer, so once a render tick elapsed the loop busy-spun until the next poll. Input waits are now paced by a dedicated render tick, dropping idle CPU to near zero.
+- **Module/env/init setup was silently dropped on submit**: when a Script Path was set, the generated `module load` / `export` / init lines shown in the preview were discarded and only the bare script was submitted. Submission now uses the previewed body whenever setup commands are present, so what you see is what runs.
+- **Unknown `#SBATCH` directives were lost**: options without a dedicated form field (e.g. `--account`) were parsed but never re-emitted, so loading a script or editing the preview dropped them on submit. They are now preserved as visible extra-parameter rows and included in the submitted command.
+- **Invalid `--gres` when resubmitting a GPU job**: `gres_detail` (e.g. `gpu:a100:2(IDX:0-1)`) was placed in the GPUs field verbatim and then re-prefixed with `gpu:`, producing `gpu:gpu:a100:2(...)`. Only the trailing GPU count is now extracted.
+- **Mouse clicks selected the wrong row in scrolled tables**: click-to-select ignored the table's scroll offset in the Jobs, History and Cluster tabs, selecting a row above the cursor once the list scrolled. Extra-parameter rows in the Composer are now clickable too.
+- **Possible crash editing multibyte text**: vertical cursor movement in the form, preview and field editors carried a byte column between lines, which could land mid-character and panic on the next edit. Cursor positions are now snapped to a char boundary.
+- **Numeric and duration columns sorted lexically**: job IDs, elapsed/time columns, and CPU/node counts sorted as strings (`99999` after `100000`, `1-00:00:00` before `02:00:00`). They now sort by value.
+- **Paste into an added extra parameter did nothing**: bracketed-paste only targeted core form fields.
+- **Header and status bar misaligned**: right-aligned banner width was measured in bytes, so the `│` separators (and `—` in error messages) shifted the layout.
+- **History window ignored the configured span**: a `history_window` that didn't match a preset (e.g. `now-5days`) highlighted the wrong selector entry; it now snaps to the nearest covering window and stays consistent.
+
+### Changed
+- **Consistent, safer keys in the Jobs tab**: `k` now moves the cursor up (matching every other tab) and job cancellation moved to `x`; the inspector no longer swallows `q` and the `1`–`4` tab switches. Command errors in the status bar are shown in red.
+- **Composer editors now use the `tui-textarea` widget**: the script preview and the Modules/Env/Init popup previously ran ~700 lines of hand-rolled, duplicated editing logic. They now use the well-tested `tui-textarea` widget, which brings undo/redo (`Ctrl+U`/`Ctrl+R`), correct Unicode handling, and standard Emacs-style editing keys, and removes ~500 lines of bespoke editor code.
+- **Composer key scheme made coherent with the editor**: copy-preview-to-clipboard moved from `Ctrl+Y` to `Ctrl+G` so it no longer shadows the editor's paste; the help bar now shows the correct undo key and a dedicated hint (with `Esc` to close) while the Modules/Env/Init popup is open.
+- **Partition is no longer required to submit**: an empty partition now lets `sbatch` fall back to the cluster's default instead of blocking submission.
+
 ## [0.1.7]
 
 ### Fixed

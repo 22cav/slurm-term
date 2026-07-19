@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -222,6 +223,29 @@ pub fn parse_duration_to_seconds(duration: &str) -> f64 {
     days * 86400.0 + secs
 }
 
+/// Compare two strings by their leading unsigned integer (so "99" < "100"),
+/// falling back to lexicographic order when either side has no leading digit.
+/// Handles job IDs ("123", "123_4") and exit codes ("0:0") sensibly.
+pub fn cmp_numeric(a: &str, b: &str) -> Ordering {
+    match (leading_u64(a), leading_u64(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
+fn leading_u64(s: &str) -> Option<u64> {
+    let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Compare two Slurm duration strings ("01:02:05", "1-00:00:00") by real
+/// elapsed time rather than lexically.
+pub fn cmp_duration(a: &str, b: &str) -> Ordering {
+    parse_duration_to_seconds(a)
+        .partial_cmp(&parse_duration_to_seconds(b))
+        .unwrap_or(Ordering::Equal)
+}
+
 /// Parse an AveCPU string to a percentage.
 pub fn parse_cpu_pct(cpu_str: &str, elapsed_seconds: f64) -> f64 {
     if cpu_str.is_empty() {
@@ -336,6 +360,20 @@ mod tests {
         assert_eq!(parse_rss_kb("2048"), Some(2.0)); // bare = bytes
         assert_eq!(parse_rss_kb(""), None);
         assert_eq!(parse_rss_kb("abc"), None);
+    }
+
+    #[test]
+    fn cmp_numeric_orders_by_value_not_lexically() {
+        assert_eq!(cmp_numeric("99999", "100000"), Ordering::Less);
+        assert_eq!(cmp_numeric("123_4", "123_2"), Ordering::Equal); // same base id
+        assert_eq!(cmp_numeric("abc", "abd"), Ordering::Less); // fallback to lexical
+    }
+
+    #[test]
+    fn cmp_duration_orders_by_elapsed_time() {
+        // 1 day beats 2 hours even though "1-..." sorts before "02:..." lexically
+        assert_eq!(cmp_duration("1-00:00:00", "02:00:00"), Ordering::Greater);
+        assert_eq!(cmp_duration("00:01:00", "00:00:30"), Ordering::Greater);
     }
 
     #[test]

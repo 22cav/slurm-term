@@ -59,22 +59,30 @@ slurm-term --since now-14days
 
 ## Key Bindings
 
+On macOS terminals that forward it (kitty, WezTerm, Ghostty), `⌘` works as an
+alias for `Ctrl`. Terminal.app and iTerm2 keep `⌘` for themselves — use `Ctrl`
+there.
+
 ### Global
 
 | Key     | Action          |
 |---------|-----------------|
 | `1-4`   | Switch tab      |
-| `q`     | Quit            |
-| `Ctrl+C`| Force quit      |
+| `q`     | Quit (while not typing) |
+| `Ctrl+C`| Quit (always)   |
+| `F5`    | Force full redraw + refresh |
 
 ### Jobs (Monitor)
 
 | Key     | Action          |
 |---------|-----------------|
 | `/`     | Search          |
+| `j`/`k` | Move down/up    |
 | `Enter` | Inspect job     |
 | `Space` | Select job      |
-| `k`     | Kill selected   |
+| `x`     | Kill selected (with confirm) |
+| `h`/`u` | Hold / release  |
+| `s` / `S` | Cycle sort column / reverse |
 | `r`     | Refresh         |
 
 ### Submit (Composer)
@@ -82,21 +90,24 @@ slurm-term --since now-14days
 | Key      | Action                    |
 |----------|---------------------------|
 | `Tab`    | Switch form/preview pane  |
-| `Enter`  | Edit field                |
-| `Arrow keys` | Navigate / edit cursor  |
+| `Enter`  | Edit field (Modules/Env/Init open a multiline editor) |
+| `Esc`    | Done editing / back to form |
 | `?`      | Parameter help            |
-| `a`      | Add extra parameter       |
-| `d`      | Delete extra parameter    |
+| `a` / `d`| Add / delete extra parameter |
 | `Ctrl+O` | Load .sbatch file         |
 | `Ctrl+S` | Submit job                |
-| `Ctrl+T` | Save template             |
-| `Ctrl+L` | Load template             |
+| `Ctrl+T` / `Ctrl+L` | Save / load template |
+| `Ctrl+G` | Copy preview to clipboard |
+
+While editing, standard Emacs-style keys apply: `Ctrl+U` undo, `Ctrl+R` redo,
+`Ctrl+K` kill line, `Ctrl+W` delete word, `Ctrl+A`/`Ctrl+E` line start/end.
 
 ### Cluster (Hardware)
 
 | Key     | Action          |
 |---------|-----------------|
 | `Tab`   | Switch view     |
+| `s` / `S` | Cycle sort column / reverse |
 | `r`     | Refresh         |
 
 ### History
@@ -105,6 +116,7 @@ slurm-term --since now-14days
 |---------|-----------------|
 | `Enter` | Inspect job     |
 | `</>`  | Change time window |
+| `s` / `S` | Cycle sort column / reverse |
 | `r`     | Refresh         |
 
 ## Configuration

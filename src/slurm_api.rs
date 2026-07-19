@@ -952,9 +952,22 @@ pub fn extract_form_state(details: &serde_json::Value) -> HashMap<String, String
         state.insert("memory".into(), value);
     }
 
+    // The GPUs form field holds a bare count; build_params re-adds the "gpu:"
+    // prefix. gres_detail arrives as "gpu:2", "gpu:a100:2", or
+    // "gpu:a100:2(IDX:0-1)" — extract just the trailing count.
     let gres = get("gres_detail");
-    if !gres.is_empty() && gres != "[]" {
-        state.insert("gpus".into(), gres);
+    if !gres.is_empty() && gres != "[]" && gres != "(null)" {
+        let count = gres
+            .split('(')
+            .next()
+            .unwrap_or(&gres)
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if count.parse::<u32>().is_ok() {
+            state.insert("gpus".into(), count.to_string());
+        }
     }
 
     state.insert("script".into(), get("command"));
@@ -1024,7 +1037,7 @@ mod tests {
             "node_count": {"set": true, "infinite": false, "number": 2},
             "cpus_per_task": {"set": true, "infinite": false, "number": 8},
             "minimum_memory_per_node": {"set": true, "infinite": false, "number": 32768},
-            "gres_detail": "gpu:a100:2",
+            "gres_detail": "gpu:a100:2(IDX:0-1)",
             "command": "/home/me/train.sh",
             "standard_output": "out.log",
         });
@@ -1034,7 +1047,7 @@ mod tests {
         assert_eq!(s["nodes"], "2");
         assert_eq!(s["cpus"], "8");
         assert_eq!(s["memory"], "32G");
-        assert_eq!(s["gpus"], "gpu:a100:2");
+        assert_eq!(s["gpus"], "2"); // bare count; build_params re-adds "gpu:"
         assert_eq!(s["script"], "/home/me/train.sh");
     }
 

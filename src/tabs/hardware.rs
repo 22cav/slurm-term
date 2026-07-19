@@ -230,12 +230,13 @@ impl HardwareState {
         let mut sorted: Vec<&SinfoRow> = self.partitions.iter().collect();
         let asc = self.part_sort_asc;
         sorted.sort_by(|a, b| {
+            use crate::validators::cmp_numeric;
             let ord = match self.part_sort_col {
                 PartSortCol::Partition => a.partition.cmp(&b.partition),
                 PartSortCol::Avail => a.avail.cmp(&b.avail),
-                PartSortCol::Nodes => a.nodes.cmp(&b.nodes),
+                PartSortCol::Nodes => cmp_numeric(&a.nodes, &b.nodes),
                 PartSortCol::State => a.state.cmp(&b.state),
-                PartSortCol::Cpus => a.cpus.cmp(&b.cpus),
+                PartSortCol::Cpus => cmp_numeric(&a.cpus, &b.cpus),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -432,19 +433,22 @@ impl HardwareState {
         }
         // Data rows (after header row at 0 and table header at 1)
         if row >= 2 {
-            let idx = (row - 2) as usize;
+            let click = (row - 2) as usize;
             match self.sub_tab {
                 SubTab::Partitions => {
+                    let idx = self.part_state.offset() + click;
                     if idx < self.partitions.len() {
                         self.part_state.select(Some(idx));
                     }
                 }
                 SubTab::Nodes => {
+                    let idx = self.node_state.offset() + click;
                     if idx < self.nodes.len() {
                         self.node_state.select(Some(idx));
                     }
                 }
                 SubTab::Storage => {
+                    let idx = self.storage_state.offset() + click;
                     if idx < self.storage.len() {
                         self.storage_state.select(Some(idx));
                     }

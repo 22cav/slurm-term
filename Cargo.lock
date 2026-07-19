@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "slurm-term"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "crossterm",
  "dirs",
@@ -565,6 +565,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "tui-textarea",
 ]
 
 [[package]]
@@ -678,6 +679,17 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "tui-textarea"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a5318dd619ed73c52a9417ad19046724effc1287fb75cdcc4eca1d6ac1acbae"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "unicode-width 0.2.0",
+]
 
 [[package]]
 name = "unicode-ident"

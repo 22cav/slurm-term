@@ -98,11 +98,11 @@ impl MonitorState {
         let asc = self.sort_asc;
         result.sort_by(|a, b| {
             let ord = match self.sort_col {
-                SortCol::Id => a.job_id.cmp(&b.job_id),
+                SortCol::Id => crate::validators::cmp_numeric(&a.job_id, &b.job_id),
                 SortCol::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortCol::Partition => a.partition.cmp(&b.partition),
                 SortCol::State => a.state.cmp(&b.state),
-                SortCol::Time => a.time_used.cmp(&b.time_used),
+                SortCol::Time => crate::validators::cmp_duration(&a.time_used, &b.time_used),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -184,7 +184,7 @@ impl MonitorState {
                     self.table_state.select(Some((i + 1).min(filtered_len - 1)));
                 }
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 let i = self.table_state.selected().unwrap_or(0);
                 self.table_state.select(Some(i.saturating_sub(1)));
             }
@@ -198,7 +198,7 @@ impl MonitorState {
             KeyCode::Char('r') => {
                 return Action::Refresh;
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('x') => {
                 let targets = self.action_targets();
                 if !targets.is_empty() {
                     return Action::CancelJobs(targets);
@@ -389,7 +389,9 @@ impl MonitorState {
         let data_start = header_offset + table_header;
 
         if row >= data_start {
-            let idx = (row - data_start) as usize;
+            // Add the scroll offset so clicks map to the right row once the
+            // table has scrolled past the top.
+            let idx = self.table_state.offset() + (row - data_start) as usize;
             let filtered_len = self.filtered_jobs().len();
             if idx < filtered_len {
                 self.table_state.select(Some(idx));
