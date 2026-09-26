@@ -1,0 +1,75 @@
+{
+  "jobs": [
+    {
+      "account": "proj",
+      "array_job_id": {"set": true, "infinite": false, "number": 0},
+      "array_task_id": {"set": false, "infinite": false, "number": 0},
+      "array_task_string": "",
+      "current_working_directory": "/home/alice/run",
+      "job_id": 5001,
+      "job_state": ["RUNNING"],
+      "name": "train",
+      "node_count": {"set": true, "infinite": false, "number": 2},
+      "nodes": "gpu[001-002]",
+      "partition": "gpu",
+      "pre_sus_time": {"set": true, "infinite": false, "number": 0},
+      "standard_output": "/home/alice/run/slurm-%j.out",
+      "standard_error": "",
+      "start_time": {"set": true, "infinite": false, "number": 1700000000},
+      "state_reason": "None",
+      "submit_time": {"set": true, "infinite": false, "number": 1699999000},
+      "suspend_time": {"set": true, "infinite": false, "number": 0},
+      "time_limit": {"set": true, "infinite": false, "number": 120},
+      "user_name": "alice"
+    },
+    {
+      "array_job_id": {"set": true, "infinite": false, "number": 6000},
+      "array_task_id": {"set": false, "infinite": false, "number": 0},
+      "array_task_string": "4-9%2",
+      "current_working_directory": "/home/alice/sweep",
+      "job_id": 6000,
+      "job_state": ["PENDING"],
+      "name": "sweep",
+      "node_count": {"set": true, "infinite": false, "number": 1},
+      "nodes": "",
+      "partition": "cpu",
+      "start_time": {"set": true, "infinite": false, "number": 0},
+      "state_reason": "JobArrayTaskLimit",
+      "submit_time": {"set": true, "infinite": false, "number": 1699999500},
+      "user_name": "alice"
+    },
+    {
+      "array_job_id": {"set": true, "infinite": false, "number": 6000},
+      "array_task_id": {"set": true, "infinite": false, "number": 3},
+      "array_task_string": "",
+      "current_working_directory": "/home/alice/sweep",
+      "job_id": 6004,
+      "job_state": ["RUNNING"],
+      "name": "sweep",
+      "node_count": {"set": true, "infinite": false, "number": 1},
+      "nodes": "cpu007",
+      "partition": "cpu",
+      "start_time": {"set": true, "infinite": false, "number": 1699913600},
+      "state_reason": "None",
+      "user_name": "alice"
+    },
+    {
+      "job_id": 7000,
+      "job_state": ["SUSPENDED"],
+      "name": "paused",
+      "partition": "cpu",
+      "start_time": {"set": true, "infinite": false, "number": 1699990000},
+      "suspend_time": {"set": true, "infinite": false, "number": 1699995000},
+      "pre_sus_time": {"set": true, "infinite": false, "number": 5000},
+      "user_name": "alice"
+    },
+    {
+      "job_id": 8000,
+      "job_state": ["RUNNING"],
+      "name": "not_mine",
+      "partition": "cpu",
+      "start_time": {"set": true, "infinite": false, "number": 1700000000},
+      "user_name": "bob"
+    }
+  ]
+}

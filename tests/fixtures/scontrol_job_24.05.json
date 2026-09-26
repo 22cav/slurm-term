@@ -1,0 +1,30 @@
+{
+  "jobs": [
+    {
+      "account": "proj",
+      "array_job_id": {"set": true, "infinite": false, "number": 0},
+      "command": "/home/alice/run/train.sh",
+      "cpus_per_task": {"set": true, "infinite": false, "number": 8},
+      "current_working_directory": "/home/alice/run",
+      "dependency": "afterok:4000",
+      "features": "a100",
+      "gres_detail": [],
+      "job_id": 5002,
+      "job_state": ["PENDING"],
+      "memory_per_cpu": {"set": true, "infinite": false, "number": 4096},
+      "memory_per_node": {"set": false, "infinite": false, "number": 0},
+      "name": "train2",
+      "node_count": {"set": true, "infinite": false, "number": 1},
+      "partition": "gpu",
+      "qos": "high",
+      "standard_error": "logs/%x-%j.err",
+      "standard_output": "logs/%x-%j.out",
+      "stdout_expanded": "/home/alice/run/logs/train2-5002.out",
+      "stderr_expanded": "/home/alice/run/logs/train2-5002.err",
+      "tasks_per_node": {"set": true, "infinite": false, "number": 4},
+      "time_limit": {"set": false, "infinite": true, "number": 0},
+      "tres_per_node": "gres/gpu:a100=2",
+      "user_name": "alice"
+    }
+  ]
+}

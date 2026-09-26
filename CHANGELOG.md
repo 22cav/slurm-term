@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — alignment with the Slurm documentation
+- **Empty "Time" column on real clusters**: the queue parser read `time.elapsed` and `working_directory`, which exist only in the `sacct --json` layout. `squeue --json` provides `start_time`/`suspend_time`/`pre_sus_time`; elapsed time is now computed the way squeue's `%M` does, and durations of a day or more print as `D-HH:MM:SS` like squeue. The work directory is read from `current_working_directory`.
+- **Short `#SBATCH` options produced invalid commands**: an unmapped short option such as `#SBATCH -n 4` or `-A proj` was re-emitted as `--n=4` / `--A=proj`, which sbatch rejects. Every short option from sbatch(1) now resolves to its long name.
+- **Flag directives were dropped**: `#SBATCH --exclusive`, `--requeue`, `-H` and other options without a value were not recognised when loading a script.
+- **Attached short values were dropped**: `-N2`, `-t30` and `-c=8` are now parsed (getopt style). Trailing `# comments` after a directive are stripped and quoted values unquoted.
+- **Directives after the first command were honoured**: sbatch stops reading `#SBATCH` lines at the first executable line; the parser now does the same and keeps the later lines verbatim in the script body.
+- **`--gpus`/`-G` changed meaning when loaded**: this is a per-job GPU count but was folded into the per-node `--gres=gpu:N` field. It now stays `--gpus`. Multi-GRES requests such as `--gres=gpu:1,nvme:1` are also kept verbatim.
+- **Logs not found for jobs using filename patterns**: the Inspector opened `standard_output` literally (e.g. `logs/%x-%j.out`). It now uses Slurm's `stdout_expanded` (24.05+) or expands `%j %J %A %a %x %u %N %%` (with zero padding) itself, resolves relative paths against the job's working directory, uses the `slurm-%j.out` default when unset, and shows stdout for stderr when stderr is not split (sbatch's default).
+- **Memory and run time in the Inspector**: memory is read from `memory_per_node`, falling back to `memory_per_cpu`, and labelled "/ node" or "/ CPU". Run time is computed from start/suspend times, so CPU% from `sstat` is correct too.
+- **Unset JSON values shown as `0`**: `{"set": false, ...}` envelopes (NO_VAL) now read as empty instead of their placeholder number.
+- **`squeue -u` ignored with `--json`** on some Slurm versions: the queue is also filtered client-side by user.
+- **Job ID parsing on submit**: sbatch is now run with `--parsable` (`jobid[;cluster]`) instead of taking the last word of the human-readable message.
+- **`--time=UNLIMITED` / `INFINITE` rejected** by the Composer's validation, although sbatch accepts them.
+- **Resubmitting a pending GPU job lost its GPUs**: `gres_detail` is only filled for running jobs; the GPU request is now read from `tres_per_node` (e.g. `gres/gpu:a100=2`) and keeps the requested type. `--mem-per-cpu`, account, QOS, dependency and constraint are carried over too.
+- **Node CPU load from JSON was 100x too high**: `scontrol show nodes --json` reports `cpu_load` as load x 100; it is now scaled like the text output. The Cluster tab also shows allocated/total CPUs.
+- **Parameter help corrected against sbatch(1)**:
+  - `--nice` range (±2147483645)
+  - `--container` (native OCI bundle path, not a docker URL; that is Pyxis's `--container-image`)
+  - `--hint` definitions
+  - all `--mail-type` values
+  - dependency types (`aftercorr`, `afterburstbuffer`, `after:id+min`, the `?` separator)
+  - `--signal` `R:` prefix
+  - `--exclusive=user|mcs|topo`
+  - `--time` day formats
+  - `--begin` keywords
+  - `--export=NONE` semantics
+  - `--open-mode` default
+  - `--distribution` levels
+
+### Added
+- **Inspect finished jobs**: jobs that slurmctld has already purged (after MinJobAge) are looked up with `sacct -j <id> --json`, so `Enter` in the History tab works for old jobs. The Inspector marks these as "from accounting (sacct)".
+- **Job arrays in the Jobs tab**: IDs are shown as squeue prints them (`120_3`, `120_[4-9%2]`). `a` groups each array into one row with a state summary (`1PD 4R`); actions on that row apply to the whole array, and the confirmation says so.
+- **Requeue (`R`)** a job with `scontrol requeue`, after a confirmation.
+- **Signal (`K`)**: a picker sends USR1/USR2/TERM/INT/HUP/CONT/STOP/KILL with `scancel --signal`, optionally to the batch step only (`--batch`).
+- **`--test-only` support**: the scheduler's start estimate is shown in the status bar and nothing is queued.
+- More sbatch options in the parameter catalog: `--gpus`, `--ntasks-per-gpu`, `--gpu-bind`, `--mem-bind`, `--time-min`, `--deadline`, `--hold`, `--kill-on-invalid-dep`, `--oversubscribe`, `--switches`, `--wckey`, `--clusters`, `--wait`, plus Pyxis's `--container-image` (marked as a plugin option).
+- Hold/release/requeue/signal report partial failures with Slurm's error message instead of always claiming success.
+
+### Changed
+- Demo mode now produces the real `squeue --json` / `scontrol show job --json` / `sacct --json` layouts and runs them through the same parsers a cluster uses. It includes a job array, and its history stays the same between polls.
+- Slurm 23.02 or newer is the supported baseline; older JSON field names are still read where it is cheap to do so.
+
+### Tests
+- The suite grows from 55 to 103 tests. It adds JSON fixtures in `tests/fixtures/` for squeue 23.11, scontrol 24.05 and sacct, which cover elapsed time, arrays, user filtering, form extraction, log-path resolution and the sacct mapping.
+- The sbatch parser gets its first tests: short options, flags, attached values, comments, directive scope, GPU semantics and CRLF input.
+- Composer tests check that no invalid `--X` option is ever emitted, that the preview round-trips through the parser, and that every catalog key is valid.
+- Monitor tests cover array grouping, action targets and the signal picker.
+- Mock contract tests check that demo data satisfies the real parsers.
+
 ## [0.1.8]
 
 ### Fixed

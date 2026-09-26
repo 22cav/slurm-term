@@ -1,0 +1,32 @@
+{
+  "jobs": [
+    {
+      "account": "proj",
+      "array": {"job_id": 0, "task_id": {"set": false, "infinite": false, "number": 0}, "task": ""},
+      "exit_code": {"status": ["EXITED"], "return_code": {"set": true, "infinite": false, "number": 1}},
+      "job_id": 4000,
+      "name": "prep",
+      "nodes": "cpu003",
+      "partition": "cpu",
+      "qos": "normal",
+      "required": {
+        "CPUs": 4,
+        "memory_per_cpu": {"set": false, "infinite": false, "number": 0},
+        "memory_per_node": {"set": true, "infinite": false, "number": 8192}
+      },
+      "state": {"current": ["FAILED"], "reason": "None"},
+      "stdout": "%x-%j.out",
+      "stderr": "",
+      "submit_line": "sbatch prep.sh",
+      "time": {
+        "elapsed": 3725,
+        "end": 1700003725,
+        "limit": {"set": true, "infinite": false, "number": 60},
+        "start": 1700000000,
+        "submission": 1699999900
+      },
+      "user": "alice",
+      "working_directory": "/home/alice/prep"
+    }
+  ]
+}

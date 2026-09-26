@@ -11,10 +11,10 @@ Monitor jobs, compose batch scripts or interactive sessions, explore cluster har
 
 ## Features
 
-- **Jobs** — Live job queue with search, selection, bulk cancel/hold/release, and inline inspection
+- **Jobs** — Live job queue with search, selection, bulk cancel/hold/release/requeue, signals, job-array grouping, and inline inspection
 - **Submit** — Interactive job composer with form + preview pane, input validation, parameter catalog with docs (`?`), and `.sbatch` file loading (`Ctrl+O`). In `srun` mode, submitting suspends the TUI and drops you into the interactive session; exit the shell to return
 - **Cluster** — Partition and node hardware overview
-- **History** — Completed job history with configurable time window
+- **History** — Completed job history with configurable time window; finished jobs can be inspected from Slurm accounting (`sacct`)
 - **Mouse support** — Click to navigate tabs, select jobs, and interact with the form
 - **Templates** — Save and load job templates (`Ctrl+T` / `Ctrl+L`)
 
@@ -40,6 +40,13 @@ cd slurm-term
 cargo build --release
 # Binary at target/release/slurm-term
 ```
+
+## Requirements
+
+Slurm 23.02 or newer is the supported baseline. The Slurm client commands
+(`squeue`, `sbatch`, `scontrol`, `sacct`, `sstat`, `sinfo`, `scancel`) must be on
+`PATH`, and `squeue`/`scontrol`/`sacct` must support `--json`. Inspecting old
+jobs from the History tab needs accounting (slurmdbd) to be enabled.
 
 ## Usage
 
@@ -82,6 +89,9 @@ there.
 | `Space` | Select job      |
 | `x`     | Kill selected (with confirm) |
 | `h`/`u` | Hold / release  |
+| `R`     | Requeue (with confirm) |
+| `K`     | Send a signal (`b` in the picker: batch step only) |
+| `a`     | Group / ungroup job-array tasks |
 | `s` / `S` | Cycle sort column / reverse |
 | `r`     | Refresh         |
 

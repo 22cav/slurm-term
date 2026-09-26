@@ -126,11 +126,15 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Maximum wall-clock time for the job",
         long_desc: "Sets the maximum wall-clock time the job may run. If the job\n\
             exceeds this limit Slurm will send SIGTERM followed by SIGKILL.\n\n\
-            Acceptable formats:\n\
+            Acceptable formats (sbatch(1)):\n\
             - minutes            (e.g. 120)\n\
             - MM:SS              (e.g. 30:00)\n\
             - HH:MM:SS           (e.g. 02:00:00)\n\
-            - D-HH:MM:SS         (e.g. 1-12:00:00)\n\n\
+            - D-HH               (e.g. 2-12)\n\
+            - D-HH:MM            (e.g. 2-12:30)\n\
+            - D-HH:MM:SS         (e.g. 1-12:00:00)\n\
+            - UNLIMITED / INFINITE  (partition MaxTime applies)\n\n\
+            A limit of 0 also means no limit.\n\n\
             Tip: Setting an accurate time limit improves scheduling priority\n\
             because the scheduler can backfill shorter jobs.",
         is_flag: false,
@@ -175,7 +179,8 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Minimum memory per node",
         long_desc: "Specifies the minimum RAM required per node. Default unit is\n\
             megabytes; use suffixes K, M, G, T for other units.\n\n\
-            --mem=0 grants all available memory on the node.\n\
+            --mem=0 requests all memory on each node (the whole node's\n\
+            memory is allocated, not \"no limit\").\n\
             Mutually exclusive with --mem-per-cpu and --mem-per-gpu.\n\n\
             Examples:\n  --mem=4G     (4 gigabytes)\n  --mem=64G    (64 gigabytes)\n  --mem=0      (all available memory)",
         is_flag: false,
@@ -186,7 +191,8 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Generic resources (GPUs, FPGAs, etc.)",
         long_desc: "Requests generic consumable resources per node. Most commonly\n\
             used for GPUs.\n\n\
-            Format: name[:type[:count]] -- count defaults to 1.\n\n\
+            Format: name[[:type]:count][,name...] -- count defaults to 1.\n\
+            The count is per node.\n\n\
             In the form, just enter the number of GPUs. The 'gpu:' prefix\n\
             is added automatically.\n\n\
             Examples (form field):\n  1         -> --gres=gpu:1\n  a100:2    -> --gres=gpu:a100:2",
@@ -257,9 +263,8 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         key: "gpus-per-node",
         label: "GPUs / Node",
         short_desc: "Number of GPUs per allocated node",
-        long_desc: "Requests a specific number of GPUs on each node. Functionally\n\
-            equivalent to --gres=gpu:<count> but clearer for multi-node\n\
-            GPU jobs.\n\n\
+        long_desc: "Requests a specific number of GPUs on each node, like\n\
+            --gres=gpu:<count>. Do not combine the two for GPUs.\n\n\
             Can optionally specify GPU type: --gpus-per-node=a100:2\n\n\
             Example: --gpus-per-node=4",
         is_flag: false,
@@ -300,7 +305,8 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         long_desc: "Requests nodes with specific features set by the administrator\n\
             (e.g. CPU architecture, GPU model, interconnect type).\n\n\
             Operators:\n  &  AND (both features required)\n  |  OR  (either acceptable)\n\n\
-            Use 'sinfo -o \"%N %f\"' to list node features.\n\n\
+            Also: [a*2&b*1] per-node counts, [a|b] all nodes the same\n\
+            feature. Use 'sinfo -o \"%N %f\"' to list node features.\n\n\
             Examples:\n  --constraint=haswell\n  --constraint='gpu_a100|gpu_v100'",
         is_flag: false,
     },
@@ -314,7 +320,10 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
             - Benchmarking (no interference from other jobs)\n\
             - Applications needing all memory, cache, or I/O bandwidth\n\
             - GPU jobs that need all GPUs on a node\n\n\
-            No value needed -- this is a flag.",
+            Optional values: --exclusive=user (share only with your own\n\
+            jobs), =mcs (share with jobs of the same MCS label),\n\
+            =topo (exclusive topology block/segment).\n\
+            With no value this is a flag.",
         is_flag: true,
     },
     // Notifications
@@ -334,12 +343,17 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         long_desc: "Selects which job events generate email notifications.\n\
             Multiple types can be comma-separated.\n\n\
             Values:\n\
-            - NONE         no emails\n\
-            - BEGIN        job starts\n\
-            - END          job completes\n\
-            - FAIL         job fails\n\
-            - ALL          all events\n\
-            - TIME_LIMIT   approaching time limit\n\n\
+            - NONE            no emails\n\
+            - BEGIN           job starts\n\
+            - END             job completes\n\
+            - FAIL            job fails\n\
+            - REQUEUE         job is requeued\n\
+            - ALL             BEGIN, END, FAIL, INVALID_DEPEND, REQUEUE, STAGE_OUT\n\
+            - INVALID_DEPEND  dependency can never be satisfied\n\
+            - STAGE_OUT       burst buffer stage out completed\n\
+            - TIME_LIMIT      reached the time limit\n\
+            - TIME_LIMIT_50/80/90  reached 50/80/90% of the limit\n\
+            - ARRAY_TASKS     mail per array task, not per array\n\n\
             Example: --mail-type=END,FAIL",
         is_flag: false,
     },
@@ -366,11 +380,17 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         long_desc: "Prevents the job from starting until specified dependencies\n\
             on other jobs are satisfied.\n\n\
             Types:\n\
-            - after:JOBID        begin after JOBID starts\n\
-            - afterok:JOBID      begin after JOBID succeeds\n\
+            - after:JOBID[+min]  begin after JOBID starts (or is cancelled),\n\
+                                 optionally +min minutes later\n\
+            - afterok:JOBID      begin after JOBID succeeds (exit 0)\n\
             - afternotok:JOBID   begin after JOBID fails\n\
-            - afterany:JOBID     begin after JOBID finishes\n\
-            - singleton          wait for same-name jobs\n\n\
+            - afterany:JOBID     begin after JOBID ends in any way\n\
+            - aftercorr:JOBID    array task N starts after task N of JOBID succeeds\n\
+            - afterburstbuffer:JOBID  after JOBID ends and its burst\n\
+                                 buffer stage-out completes\n\
+            - singleton          one running job per name and user\n\n\
+            Several jobs: afterok:1:2. Several conditions: ',' (all\n\
+            must hold) or '?' (any one).\n\n\
             Example: --dependency=afterok:12345",
         is_flag: false,
     },
@@ -392,9 +412,12 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Control environment variable propagation",
         long_desc: "Controls which environment variables are passed to the job.\n\n\
             - ALL    export everything (default)\n\
-            - NONE   clean environment, only SLURM_* defined\n\
-            - VAR1,VAR2=val  export specific variables only\n\n\
-            Using NONE is recommended for reproducibility.\n\n\
+            - NONE   do not propagate the submission environment; the\n\
+                     job starts with only SLURM_* variables\n\
+            - ALL,VAR=val  everything plus overrides\n\
+            - VAR1,VAR2=val  only these (and SLURM_*) variables\n\n\
+            Note: with NONE, srun steps inside the script inherit the\n\
+            job's environment, not yours.\n\n\
             Example: --export=ALL",
         is_flag: false,
     },
@@ -405,10 +428,12 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Defer job until a specific time",
         long_desc: "Delays job eligibility until the specified time.\n\n\
             Formats:\n\
-            - YYYY-MM-DDTHH:MM:SS  (absolute timestamp)\n\
-            - now+Nminutes         (relative offset)\n\
-            - now+Nhours / now+Ndays\n\
-            - midnight, noon       (special keywords)\n\n\
+            - HH:MM[:SS]           (today, or tomorrow if past)\n\
+            - YYYY-MM-DD[THH:MM[:SS]]  (absolute timestamp)\n\
+            - now+N[seconds|minutes|hours|days|weeks]\n\
+                                   (bare N is seconds)\n\
+            - midnight, noon, fika (3 PM), teatime (4 PM),\n\
+              today, tomorrow\n\n\
             Example: --begin=now+2hours",
         is_flag: false,
     },
@@ -428,7 +453,9 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Scheduling priority adjustment",
         long_desc: "Adjusts the job's scheduling priority. Positive values lower\n\
             priority; negative values raise it (may require admin privilege).\n\n\
-            Range: -10000 to 10000. Default: 0.\n\n\
+            Range: -2147483645 to 2147483645. Given without a value,\n\
+            --nice lowers priority by 100. Only privileged users may\n\
+            use negative values.\n\n\
             Example: --nice=100  (lower priority, more polite)",
         is_flag: false,
     },
@@ -477,9 +504,12 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
     ParamEntry {
         key: "requeue",
         label: "Requeue",
-        short_desc: "Allow job requeue on failure",
-        long_desc: "Permits the job to be requeued if a node fails or the job is\n\
-            preempted. The job restarts from the beginning.\n\n\
+        short_desc: "Allow job requeue",
+        long_desc: "Permits the job to be requeued after a node failure or\n\
+            preemption, or by 'scontrol requeue'. The job restarts from\n\
+            the beginning; the default comes from JobRequeue in\n\
+            slurm.conf. $SLURM_RESTART_COUNT tells the script how often\n\
+            it was restarted.\n\n\
             No value needed -- this is a flag.",
         is_flag: true,
     },
@@ -497,8 +527,12 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Send signal before time limit",
         long_desc: "Sends a signal to the job a specified number of seconds before\n\
             the time limit expires, allowing graceful checkpoint/shutdown.\n\n\
-            Format: [B:]signal_name@seconds_before_end\n\
-              B: prefix sends to the batch step only\n\n\
+            Format: [{R|B}:]<sig_num|sig_name>[@sig_time]\n\
+              B:  signal only the batch shell (not other steps)\n\
+              R:  allow the job to overlap a reservation; the signal\n\
+                  is sent before the reservation starts\n\
+              sig_time defaults to 60 seconds. Delivery may be up\n\
+              to 60 seconds early due to event resolution.\n\n\
             Example: --signal=USR1@120   (SIGUSR1, 2 min before end)",
         is_flag: false,
     },
@@ -506,9 +540,10 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
     ParamEntry {
         key: "tmp",
         label: "Tmp Disk",
-        short_desc: "Minimum /tmp disk space per node (MB)",
+        short_desc: "Minimum temporary disk space per node",
         long_desc: "Requests that each allocated node has at least this much\n\
-            temporary disk space available (in megabytes).\n\n\
+            temporary disk space (TmpFS) available. Default unit is\n\
+            megabytes; suffixes K, M, G, T are accepted.\n\n\
             Example: --tmp=10240  (10 GB of temp space)",
         is_flag: false,
     },
@@ -542,10 +577,13 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
     ParamEntry {
         key: "container",
         label: "Container",
-        short_desc: "OCI container image",
-        long_desc: "Specifies an OCI container image for the job. Requires\n\
-            container support (e.g. Pyxis plugin) in the Slurm config.\n\n\
-            Example: --container=docker://nvcr.io/nvidia/pytorch:latest",
+        short_desc: "OCI container bundle path (native Slurm)",
+        long_desc: "Absolute path to an unpacked OCI container bundle the job\n\
+            runs inside. Requires oci.conf to be configured by the\n\
+            administrator (Slurm's native container support).\n\n\
+            Not the same as Pyxis's --container-image, which pulls an\n\
+            image such as docker://nvcr.io/nvidia/pytorch.\n\n\
+            Example: --container=/scratch/bundles/pytorch",
         is_flag: false,
     },
     ParamEntry {
@@ -564,10 +602,14 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         long_desc: "Provides a hint about the application's compute characteristics\n\
             to optimize CPU and thread binding.\n\n\
             Values:\n\
-            - compute_bound   use all cores, disable hyperthreads\n\
-            - memory_bound    use 1 thread per core\n\
-            - multithread     use all hardware threads (SMT)\n\
-            - nomultithread   explicitly disable hyperthreads\n\n\
+            - compute_bound   use all cores in each socket, one thread\n\
+                              per core\n\
+            - memory_bound    use only one core in each socket, one\n\
+                              thread per core\n\
+            - multithread     use extra threads (in-core multithreading)\n\
+            - nomultithread   do not use extra threads\n\n\
+            Incompatible with --ntasks-per-core, --threads-per-core\n\
+            and -B.\n\n\
             Example: --hint=nomultithread",
         is_flag: false,
     },
@@ -577,7 +619,10 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Output file open mode",
         long_desc: "Controls how output/error files are opened:\n\n\
             - append    append to existing file\n\
-            - truncate  overwrite existing file (default)\n\n\
+            - truncate  overwrite existing file\n\n\
+            The default comes from JobFileAppend in slurm.conf\n\
+            (truncate unless the administrator changed it). Requeued\n\
+            jobs always append.\n\n\
             Example: --open-mode=append",
         is_flag: false,
     },
@@ -587,10 +632,13 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         short_desc: "Task distribution method",
         long_desc: "Controls how tasks are distributed across nodes, sockets,\n\
             and cores.\n\n\
-            Values:\n\
-            - block   fill each node before moving to the next\n\
-            - cyclic  round-robin across nodes\n\
-            - plane=N distribute in planes of N tasks\n\n\
+            Format: <node>[:<socket>[:<core>]][,Pack|NoPack]\n\n\
+            Node-level values:\n\
+            - block      consecutive tasks share a node\n\
+            - cyclic     round-robin across nodes\n\
+            - plane=N    blocks of N tasks, round-robin\n\
+            - arbitrary  follow the order in SLURM_HOSTFILE\n\n\
+            Socket/core levels take block, cyclic or fcyclic.\n\n\
             Example: --distribution=cyclic",
         is_flag: false,
     },
@@ -598,10 +646,149 @@ pub static ALL_PARAMS: &[ParamEntry] = &[
         key: "test-only",
         label: "Test Only",
         short_desc: "Validate without submitting",
-        long_desc: "Tests the job submission without actually submitting it.\n\
-            Reports estimated start time and whether the job would be\n\
-            accepted.\n\n\
+        long_desc: "Validates the batch script and returns an estimate of when\n\
+            the job would start, given the current queue and the rest\n\
+            of the request. No job is submitted.\n\n\
+            slurm-term shows the estimate in the status bar.\n\n\
             No value needed -- this is a flag.",
         is_flag: true,
+    },
+    // GPU / binding (sbatch(1))
+    ParamEntry {
+        key: "gpus",
+        label: "GPUs (job)",
+        short_desc: "Total GPUs for the whole job",
+        long_desc: "Total number of GPUs for the job across all nodes, not\n\
+            per node (compare --gpus-per-node / --gres).\n\n\
+            Format: [type:]count. Short option: -G.\n\n\
+            Example: --gpus=a100:8",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "ntasks-per-gpu",
+        label: "Tasks / GPU",
+        short_desc: "Tasks launched per allocated GPU",
+        long_desc: "Request that there are this many tasks invoked for every\n\
+            GPU. Implies --gpu-bind=single:<ntasks-per-gpu>.\n\n\
+            Example: --ntasks-per-gpu=2",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "gpu-bind",
+        label: "GPU Bind",
+        short_desc: "Bind tasks to specific GPUs",
+        long_desc: "Binds tasks to GPUs. Common values:\n\
+            - closest          GPUs closest to the task's CPUs\n\
+            - single:N         bind N tasks to each GPU\n\
+            - map_gpu:0,1      explicit GPU per task\n\
+            - none             no binding\n\n\
+            Example: --gpu-bind=closest",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "mem-bind",
+        label: "Mem Bind",
+        short_desc: "NUMA memory binding",
+        long_desc: "Binds tasks to NUMA memory: local, rank, map_mem:<list>,\n\
+            mask_mem:<list>, none. Prefix with 'verbose,' to report.\n\n\
+            Example: --mem-bind=local",
+        is_flag: false,
+    },
+    // Scheduling
+    ParamEntry {
+        key: "time-min",
+        label: "Min Time",
+        short_desc: "Minimum acceptable time limit",
+        long_desc: "Lets the scheduler start the job earlier with a shorter\n\
+            time limit, no lower than this value (same formats as\n\
+            --time). Useful for backfill.\n\n\
+            Example: --time-min=02:00:00",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "deadline",
+        label: "Deadline",
+        short_desc: "Remove the job if it cannot finish by then",
+        long_desc: "The job is removed if it cannot end before this time.\n\
+            Formats like --begin (YYYY-MM-DD[THH:MM[:SS]], now+N...).\n\n\
+            Example: --deadline=now+2days",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "hold",
+        label: "Hold",
+        short_desc: "Submit in held state",
+        long_desc: "Submits the job with priority 0 (held). Release it with\n\
+            'scontrol release <jobid>' (or 'u' in the Jobs tab).\n\n\
+            No value needed -- this is a flag. Short option: -H.",
+        is_flag: true,
+    },
+    ParamEntry {
+        key: "kill-on-invalid-dep",
+        label: "Kill Bad Dep",
+        short_desc: "Cancel if dependency can never be met",
+        long_desc: "yes: cancel the job when its dependency can never be\n\
+            satisfied; no: leave it pending (DependencyNeverSatisfied).\n\n\
+            Example: --kill-on-invalid-dep=yes",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "oversubscribe",
+        label: "Oversubscribe",
+        short_desc: "Share resources with other jobs",
+        long_desc: "Allows the job's resources to be shared with other running\n\
+            jobs, if the partition's OverSubscribe setting permits it.\n\n\
+            No value needed -- this is a flag. Short option: -s.",
+        is_flag: true,
+    },
+    ParamEntry {
+        key: "switches",
+        label: "Switches",
+        short_desc: "Max leaf switches for the allocation",
+        long_desc: "Maximum count of leaf switches desired for the job\n\
+            allocation, optionally with a maximum wait for that many.\n\n\
+            Format: count[@max-time]\n\n\
+            Example: --switches=1@1:00:00",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "wckey",
+        label: "WCKey",
+        short_desc: "Workload characterization key",
+        long_desc: "Tags the job with a workload characterization key used for\n\
+            accounting reports (sreport).\n\n\
+            Example: --wckey=projectX",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "clusters",
+        label: "Clusters",
+        short_desc: "Submit to another cluster",
+        long_desc: "Cluster(s) to submit to in a multi-cluster setup. With\n\
+            several names the job runs on the one that can start it\n\
+            earliest. Short option: -M.\n\n\
+            Example: --clusters=cluster2",
+        is_flag: false,
+    },
+    ParamEntry {
+        key: "wait",
+        label: "Wait",
+        short_desc: "sbatch returns only when the job ends",
+        long_desc: "Do not exit until the submitted job terminates. The exit\n\
+            code of sbatch will be that of the job.\n\n\
+            Note: this blocks slurm-term until the job finishes or the\n\
+            subprocess timeout expires -- rarely what you want here.\n\n\
+            No value needed -- this is a flag. Short option: -W.",
+        is_flag: true,
+    },
+    ParamEntry {
+        key: "container-image",
+        label: "Container Image",
+        short_desc: "Container image (Pyxis plugin, not core Slurm)",
+        long_desc: "Provided by the NVIDIA Pyxis SPANK plugin, when your site\n\
+            installs it -- not part of core Slurm. Pulls and runs the job\n\
+            in the given image.\n\n\
+            Example: --container-image=nvcr.io#nvidia/pytorch:24.01-py3",
+        is_flag: false,
     },
 ];

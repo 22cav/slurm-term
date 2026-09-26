@@ -2166,4 +2166,85 @@ mod tests {
         assert!(body.contains("python train.py"));
         assert!(body.contains("/home/me/train.sh"));
     }
+
+    /// A key sbatch accepts as `--<key>`: a catalog entry or at least a
+    /// multi-character long option name (never a bare short letter).
+    fn is_valid_long_option(k: &str) -> bool {
+        param_catalog::lookup(k).is_some()
+            || (k.len() > 1
+                && k.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+    }
+
+    #[test]
+    fn short_directives_never_emit_invalid_long_options() {
+        let mut c = ComposerState::new();
+        let state = sbatch_parser::parse_sbatch_text(
+            "#!/bin/bash\n#SBATCH -n 4\n#SBATCH -A proj\n#SBATCH -q high\n#SBATCH -a 0-9%2\n\
+             #SBATCH -d afterok:1\n#SBATCH -w node01\n#SBATCH -x node02\n#SBATCH -C a100\n\
+             #SBATCH -G 2\n#SBATCH -H\necho hi\n",
+        );
+        c.set_form_state(&state);
+        let params = c.build_params();
+        for k in params.keys() {
+            assert!(is_valid_long_option(k), "invalid option emitted: --{k}");
+        }
+        assert_eq!(params.get("ntasks"), Some(&"4".to_string()));
+        assert_eq!(params.get("account"), Some(&"proj".to_string()));
+        assert_eq!(params.get("array"), Some(&"0-9%2".to_string()));
+        assert_eq!(params.get("gpus"), Some(&"2".to_string()));
+        assert_eq!(params.get("hold"), Some(&String::new()));
+        let preview = c.generate_preview();
+        assert!(!preview.contains("--n="), "{preview}");
+        assert!(preview.contains("#SBATCH --hold\n"), "{preview}");
+    }
+
+    #[test]
+    fn preview_round_trips_through_the_parser() {
+        let mut c = ComposerState::new();
+        let state = sbatch_parser::parse_sbatch_text(
+            "#!/bin/bash\n#SBATCH --job-name=rt\n#SBATCH --time=1-00:00:00\n#SBATCH --exclusive\n\
+             #SBATCH --gres=gpu:a100:2\n#SBATCH --mail-type=END,FAIL\n\nmodule load cuda\npython x.py\n",
+        );
+        c.set_form_state(&state);
+        let first = c.build_params();
+        let preview = c.generate_preview();
+        let mut c2 = ComposerState::new();
+        c2.set_form_state(&sbatch_parser::parse_sbatch_text(&preview));
+        assert_eq!(c2.build_params(), first);
+        assert_eq!(first.get("gres"), Some(&"gpu:a100:2".to_string()));
+        assert_eq!(first.get("exclusive"), Some(&String::new()));
+    }
+
+    #[test]
+    fn unlimited_time_is_accepted() {
+        let mut c = ComposerState::new();
+        c.set(Field::Name, "job".into());
+        c.set(Field::Init, "true".into());
+        c.set(Field::Time, "UNLIMITED".into());
+        assert_eq!(c.validate(), None);
+    }
+
+    #[test]
+    fn test_only_submit_reports_estimate_instead_of_job_id() {
+        let slurm = MockSlurmController::new(0, Some(1));
+        let params = HashMap::from([("test-only".to_string(), String::new())]);
+        match slurm.submit_job("x.sh", &params).unwrap() {
+            crate::slurm_api::SubmitOutcome::TestOnly(msg) => assert!(msg.contains("to start at")),
+            other => panic!("expected TestOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_catalog_key_is_a_valid_long_option() {
+        for p in param_catalog::ALL_PARAMS {
+            assert!(is_valid_long_option(p.key), "{}", p.key);
+            assert!(!p.short_desc.is_empty() && !p.long_desc.is_empty(), "{}", p.key);
+        }
+        let mut keys: Vec<_> = param_catalog::ALL_PARAMS.iter().map(|p| p.key).collect();
+        keys.sort();
+        let n = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "duplicate catalog keys");
+    }
 }

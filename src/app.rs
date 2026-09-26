@@ -367,6 +367,21 @@ impl App {
         self.set_status_ttl(msg, 5);
     }
 
+    /// Status line for a bulk job action, surfacing Slurm's error when any
+    /// target failed (scontrol/scancel reject e.g. holding a running job).
+    fn report_bulk(&mut self, verb: &str, ok: usize, total: usize) {
+        if ok == total {
+            self.set_status(&format!("{verb} {ok} job(s)"));
+        } else {
+            let why = self
+                .slurm
+                .take_last_error()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            self.set_status_ttl(&format!("! {verb} {ok}/{total} job(s){why}"), 10);
+        }
+    }
+
     fn set_status_ttl(&mut self, msg: &str, secs: u64) {
         self.status = Some(StatusMsg {
             text: msg.to_string(),
@@ -556,6 +571,9 @@ impl App {
                         key("s"), desc("Sort"), sep(),
                         key("h/u"), desc("Hold/Release"), sep(),
                         key("x"), desc("Kill"), sep(),
+                        key("R"), desc("Requeue"), sep(),
+                        key("K"), desc("Signal"), sep(),
+                        key("a"), desc(if self.monitor.group_arrays { "Ungroup" } else { "Group arrays" }), sep(),
                         key("r"), desc("Refresh"),
                     ]);
                 }
@@ -736,15 +754,9 @@ impl App {
                     monitor::Action::Refresh => {
                         self.monitor.poll(&*self.slurm);
                     }
-                    monitor::Action::CancelJobs(ids) => {
-                        let n = ids.len();
-                        let msg = if n == 1 {
-                            format!("Cancel job {}?", ids[0])
-                        } else {
-                            format!("Cancel {n} selected jobs?")
-                        };
+                    monitor::Action::CancelJobs(ids, what) => {
                         self.confirm = Some(ConfirmDialog {
-                            message: msg,
+                            message: format!("Cancel {what}?"),
                             on_yes: Box::new(move |app| {
                                 let mut ok = 0;
                                 for id in &ids {
@@ -759,17 +771,32 @@ impl App {
                         });
                     }
                     monitor::Action::HoldJobs(ids) => {
-                        for id in &ids {
-                            self.slurm.hold_job(id);
-                        }
-                        self.set_status(&format!("Held {} job(s)", ids.len()));
+                        let ok = ids.iter().filter(|id| self.slurm.hold_job(id)).count();
+                        self.report_bulk("Held", ok, ids.len());
                         self.monitor.poll(&*self.slurm);
                     }
                     monitor::Action::ReleaseJobs(ids) => {
-                        for id in &ids {
-                            self.slurm.release_job(id);
-                        }
-                        self.set_status(&format!("Released {} job(s)", ids.len()));
+                        let ok = ids.iter().filter(|id| self.slurm.release_job(id)).count();
+                        self.report_bulk("Released", ok, ids.len());
+                        self.monitor.poll(&*self.slurm);
+                    }
+                    monitor::Action::RequeueJobs(ids, what) => {
+                        self.confirm = Some(ConfirmDialog {
+                            message: format!("Requeue {what}? It restarts from the beginning."),
+                            on_yes: Box::new(move |app| {
+                                let ok = ids.iter().filter(|id| app.slurm.requeue_job(id)).count();
+                                app.monitor.selected.clear();
+                                app.report_bulk("Requeued", ok, ids.len());
+                                app.monitor.poll(&*app.slurm);
+                            }),
+                        });
+                    }
+                    monitor::Action::SignalJobs(ids, sig, batch) => {
+                        let ok = ids
+                            .iter()
+                            .filter(|id| self.slurm.signal_job(id, &sig, batch))
+                            .count();
+                        self.report_bulk(&format!("Sent SIG{sig} to"), ok, ids.len());
                         self.monitor.poll(&*self.slurm);
                     }
                     monitor::Action::Resubmit(form_state) => {
@@ -804,10 +831,15 @@ impl App {
                             Err("No script content to submit".into())
                         };
                         match result {
-                            Ok(id) => {
+                            Ok(crate::slurm_api::SubmitOutcome::Submitted(id)) => {
                                 self.set_status(&format!("Job {id} submitted"));
                                 self.active_tab = TabId::Monitor;
                                 self.monitor.poll(&*self.slurm);
+                            }
+                            Ok(crate::slurm_api::SubmitOutcome::TestOnly(estimate)) => {
+                                // --test-only validates without queueing:
+                                // stay in the Composer and show the estimate.
+                                self.set_status(&format!("Test only (not submitted): {estimate}"));
                             }
                             Err(e) => self.set_status(&format!("! Submit failed: {e}")),
                         }

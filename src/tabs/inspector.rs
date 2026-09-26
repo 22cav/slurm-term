@@ -5,9 +5,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::slurm_api::{job_state_of, slurm_val_to_f64, slurm_val_to_string, SlurmController};
+use crate::slurm_api::{
+    field, format_epoch, job_elapsed_secs, job_state_of, now_epoch, resolve_log_path,
+    slurm_val_to_f64, slurm_val_to_string, SlurmController,
+};
 use crate::theme;
-use crate::validators::{format_hms, parse_rss_to_pct, parse_cpu_pct};
+use crate::validators::{format_hms, format_slurm_duration, parse_rss_to_pct, parse_cpu_pct};
 
 const METRICS_ROLLING_WINDOW: usize = 60;
 const MEMORY_FALLBACK_MB: u64 = 64_000;
@@ -158,22 +161,58 @@ impl InspectorState {
         }
     }
 
-    /// Return a memory field (MiB in Slurm's JSON) formatted as MiB or GiB.
-    fn get_mem_str(&self, key: &str) -> String {
-        let mib = self
+    /// The job's memory request: `--mem` (per node) or `--mem-per-cpu`,
+    /// reported in MiB by Slurm's JSON, formatted as MiB or GiB.
+    fn get_mem_str(&self) -> String {
+        let Some(d) = self.details.as_ref() else {
+            return "N/A".to_string();
+        };
+        let pick = |keys: &[&str]| field(d, keys).and_then(slurm_val_to_f64).filter(|&m| m > 0.0);
+        let (mib, unit) = match pick(&["memory_per_node", "minimum_memory_per_node"]) {
+            Some(m) => (m, "node"),
+            None => match pick(&["memory_per_cpu"]) {
+                Some(m) => (m, "CPU"),
+                None => return "N/A".to_string(),
+            },
+        };
+        if mib >= 1024.0 {
+            format!("{:.1} GiB / {unit}", mib / 1024.0)
+        } else {
+            format!("{mib:.0} MiB / {unit}")
+        }
+    }
+
+    /// First present field among `keys`, as display text.
+    fn get_first(&self, keys: &[&str], default: &str) -> String {
+        let s = self
             .details
             .as_ref()
-            .and_then(|d| d.get(key))
-            .and_then(slurm_val_to_f64)
-            .unwrap_or(0.0);
-        if mib <= 0.0 {
-            return "N/A".to_string();
+            .and_then(|d| field(d, keys))
+            .map(slurm_val_to_string)
+            .unwrap_or_default();
+        if s.is_empty() { default.to_string() } else { s }
+    }
+
+    /// Run time as squeue computes it (see [`job_elapsed_secs`]).
+    fn run_time_str(&self) -> String {
+        match self.details.as_ref() {
+            Some(d) => format_slurm_duration(job_elapsed_secs(d, now_epoch())),
+            None => "N/A".to_string(),
         }
-        if mib >= 1024.0 {
-            format!("{:.1} GiB", mib / 1024.0)
-        } else {
-            format!("{mib:.0} MiB")
-        }
+    }
+
+    /// True when the details came from accounting (sacct) because slurmctld
+    /// no longer knows the job.
+    fn is_from_accounting(&self) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|d| d.get("slurmterm_source").is_some())
+    }
+
+    /// Local path of the log currently shown (stdout or stderr).
+    fn log_path(&self) -> Option<String> {
+        let d = self.details.as_ref()?;
+        resolve_log_path(d, self.log_mode == LogMode::Stderr)
     }
 
     pub fn load_job(&mut self, job_id: &str, slurm: &dyn SlurmController) {
@@ -238,16 +277,13 @@ impl InspectorState {
             None => return,
         };
 
-        let total_mem_mb = details
-            .get("minimum_memory_per_node")
+        let total_mem_mb = field(details, &["memory_per_node", "minimum_memory_per_node"])
             .and_then(slurm_val_to_f64)
+            .filter(|&m| m > 0.0)
             .map(|m| m as i64)
             .unwrap_or(MEMORY_FALLBACK_MB as i64);
 
-        let run_time = details
-            .get("run_time")
-            .and_then(slurm_val_to_f64)
-            .unwrap_or(0.0);
+        let run_time = job_elapsed_secs(details, now_epoch()) as f64;
 
         let cpu_val = parse_cpu_pct(&sstat.avg_cpu, run_time);
         let mem_val = parse_rss_to_pct(&sstat.max_rss, total_mem_mb);
@@ -294,11 +330,7 @@ impl InspectorState {
 
     /// Reload log file. If `force` is false, skip re-read when file size is unchanged.
     fn load_log_tail_inner(&mut self, force: bool) {
-        let path_key = match self.log_mode {
-            LogMode::Stdout => "standard_output",
-            LogMode::Stderr => "standard_error",
-        };
-        let path = self.get_str(path_key);
+        let path = self.log_path().unwrap_or_default();
         if path.is_empty() || path == "(null)" {
             self.log_lines = vec!["No log file path available".to_string()];
             self.clamp_log_scroll();
@@ -455,26 +487,50 @@ impl InspectorState {
                 format!("  #{jid}"),
                 Style::default().fg(theme::MUTED),
             ),
+            if self.is_from_accounting() {
+                Span::styled("  from accounting (sacct)", Style::default().fg(theme::YELLOW))
+            } else {
+                Span::raw("")
+            },
         ]);
         f.render_widget(Paragraph::new(header).style(Style::default().bg(theme::BG)), area);
     }
 
     fn draw_overview(&self, f: &mut Frame, area: Rect) {
         let jid = self.job_id.as_deref().unwrap_or("?").to_string();
-        let fields: Vec<(&str, String)> = vec![
+        let d = self.details.as_ref();
+        let submit = format_epoch(d.and_then(|d| d.get("submit_time")));
+        let start = format_epoch(d.and_then(|d| d.get("start_time")));
+        let log = |stderr: bool| {
+            d.and_then(|d| resolve_log_path(d, stderr))
+                .unwrap_or_else(|| "N/A".to_string())
+        };
+        let mut fields: Vec<(&str, String)> = vec![
             ("Job ID", jid),
             ("Partition", self.get_str_or("partition", "N/A")),
-            ("User", self.get_str_or("user_name", "N/A")),
+            ("User", self.get_first(&["user_name", "user"], "N/A")),
+            ("Account / QOS", format!(
+                "{} / {}",
+                self.get_str_or("account", "N/A"),
+                self.get_str_or("qos", "N/A")
+            )),
             ("State", self.get_str_or("job_state", "N/A")),
-            ("Work Dir", self.get_str_or("working_directory", "N/A")),
+            ("Reason", self.get_str_or("state_reason", "N/A")),
+            ("Work Dir", self.get_first(&["current_working_directory", "working_directory"], "N/A")),
             ("Nodes", self.get_str_or("nodes", "N/A")),
             ("CPUs/Task", self.get_str_or("cpus_per_task", "N/A")),
-            ("Memory", self.get_mem_str("minimum_memory_per_node")),
+            ("Memory", self.get_mem_str()),
             ("Time Limit", self.get_time_str("time_limit", true)),
-            ("Run Time", self.get_time_str("run_time", false)),
-            ("stdout", self.get_str_or("standard_output", "N/A")),
-            ("stderr", self.get_str_or("standard_error", "N/A")),
+            ("Run Time", self.run_time_str()),
+            ("Submitted", if submit.is_empty() { "N/A".into() } else { submit }),
+            ("Started", if start.is_empty() { "N/A".into() } else { start }),
+            ("stdout", log(false)),
+            ("stderr", log(true)),
         ];
+        let exit = self.get_str("exit_code");
+        if !exit.is_empty() {
+            fields.push(("Exit Code", exit));
+        }
 
         let rows: Vec<Row> = fields
             .iter()
@@ -500,11 +556,7 @@ impl InspectorState {
             LogMode::Stdout => "stdout",
             LogMode::Stderr => "stderr",
         };
-        let path_key = match self.log_mode {
-            LogMode::Stdout => "standard_output",
-            LogMode::Stderr => "standard_error",
-        };
-        let path = self.get_str(path_key);
+        let path = self.log_path().unwrap_or_default();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

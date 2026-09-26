@@ -338,7 +338,12 @@ impl HardwareState {
                 Row::new(vec![
                     Cell::from(format!("  {}", f("NodeName"))).style(Style::default().fg(theme::TEXT)),
                     Cell::from(state).style(state_style),
-                    Cell::from(f("CPUTot")).style(Style::default().fg(theme::DIM)),
+                    // "alloc/total" when the controller reports allocation
+                    Cell::from(match n.fields.get("CPUAlloc") {
+                        Some(alloc) => format!("{alloc}/{}", f("CPUTot")),
+                        None => f("CPUTot"),
+                    })
+                    .style(Style::default().fg(theme::DIM)),
                     Cell::from(mib_to_gib(&f("RealMemory"))).style(Style::default().fg(theme::DIM)),
                     Cell::from(f("Gres")).style(Style::default().fg(theme::MUTED)),
                     Cell::from(f("Partitions")).style(Style::default().fg(theme::MUTED)),
@@ -351,7 +356,7 @@ impl HardwareState {
         let widths = [
             Constraint::Min(14),
             Constraint::Length(10),
-            Constraint::Length(6),
+            Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Min(10),
             Constraint::Min(12),

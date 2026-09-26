@@ -10,6 +10,9 @@ static MEMORY_RE: LazyLock<Regex> =
 static JOB_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.@:+/-]*$").unwrap());
 
+/// Sentinel returned by [`parse_time`] for "UNLIMITED" / "INFINITE".
+pub const TIME_UNLIMITED: i64 = i64::MAX;
+
 /// Parse a Slurm `--time` string and return total seconds.
 ///
 /// Slurm accepts: "minutes", "minutes:seconds", "hours:minutes:seconds",
@@ -20,6 +23,11 @@ pub fn parse_time(time_str: &str) -> Result<i64, String> {
     let time_str = time_str.trim();
     if time_str.is_empty() {
         return Err("Empty time string".into());
+    }
+    // sbatch(1) also accepts "INFINITE" and "UNLIMITED" (no limit beyond
+    // the partition's MaxTime).
+    if time_str.eq_ignore_ascii_case("UNLIMITED") || time_str.eq_ignore_ascii_case("INFINITE") {
+        return Ok(TIME_UNLIMITED);
     }
 
     let (days, rest) = match time_str.split_once('-') {
@@ -59,6 +67,93 @@ pub fn format_hms(total_secs: i64) -> String {
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Format a duration the way squeue/sacct print it: `MM:SS` style padding is
+/// kept as `HH:MM:SS`, and durations of a day or more get a `D-` prefix
+/// (`1-02:03:04`).
+pub fn format_slurm_duration(total_secs: i64) -> String {
+    let total_secs = total_secs.max(0);
+    let days = total_secs / 86400;
+    let rest = format_hms(total_secs % 86400);
+    if days > 0 {
+        format!("{days}-{rest}")
+    } else {
+        rest
+    }
+}
+
+/// Values substituted into sbatch filename patterns (sbatch(1),
+/// "filename pattern"). Empty fields leave their pattern untouched.
+#[derive(Debug, Default, Clone)]
+pub struct FilenameContext {
+    pub job_id: String,
+    pub array_job_id: String,
+    pub array_task_id: String,
+    pub job_name: String,
+    pub user: String,
+    pub first_node: String,
+}
+
+/// Expand the sbatch filename patterns `%%`, `%A`, `%a`, `%j`, `%J`, `%N`,
+/// `%u` and `%x`, including zero padding (`%5j`). `%s`, `%t` and `%n` only
+/// apply to srun steps; for a batch script they are step "batch", task 0 and
+/// node 0. Unknown patterns are left as-is.
+pub fn expand_slurm_filename(pattern: &str, ctx: &FilenameContext) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut width = String::new();
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            width.push(chars[j]);
+            j += 1;
+        }
+        let Some(&code) = chars.get(j) else {
+            out.extend(&chars[i..]);
+            break;
+        };
+        let value: Option<String> = match code {
+            '%' if width.is_empty() => Some("%".into()),
+            'j' | 'J' => Some(ctx.job_id.clone()),
+            'A' => Some(if ctx.array_job_id.is_empty() {
+                ctx.job_id.clone()
+            } else {
+                ctx.array_job_id.clone()
+            }),
+            'a' => Some(if ctx.array_task_id.is_empty() {
+                // sbatch substitutes 4294967294 (NO_VAL) for non-array jobs
+                "4294967294".into()
+            } else {
+                ctx.array_task_id.clone()
+            }),
+            'x' => Some(ctx.job_name.clone()),
+            'u' => Some(ctx.user.clone()),
+            'N' => Some(ctx.first_node.clone()),
+            's' => Some("batch".into()),
+            't' | 'n' => Some("0".into()),
+            _ => None,
+        };
+        match value {
+            Some(v) if !v.is_empty() || code == '%' => {
+                let pad: usize = width.parse().unwrap_or(0).min(10);
+                let numeric = v.chars().all(|c| c.is_ascii_digit());
+                if numeric && v.len() < pad {
+                    out.push_str(&"0".repeat(pad - v.len()));
+                }
+                out.push_str(&v);
+            }
+            _ => out.extend(&chars[i..=j]),
+        }
+        i = j + 1;
+    }
+    out
 }
 
 /// Parse a memory string like "4G" into megabytes.
@@ -298,6 +393,58 @@ mod tests {
         assert!(parse_time("1:2:3:4").is_err());
         assert!(parse_time("x-12").is_err());
         assert!(parse_time("2-").is_err());
+    }
+
+    #[test]
+    fn parse_time_accepts_unlimited() {
+        assert_eq!(parse_time("UNLIMITED").unwrap(), TIME_UNLIMITED);
+        assert_eq!(parse_time("infinite").unwrap(), TIME_UNLIMITED);
+    }
+
+    #[test]
+    fn format_slurm_duration_adds_day_prefix() {
+        assert_eq!(format_slurm_duration(0), "00:00:00");
+        assert_eq!(format_slurm_duration(3725), "01:02:05");
+        assert_eq!(format_slurm_duration(86400 + 3600 * 2 + 3), "1-02:00:03");
+        assert_eq!(format_slurm_duration(-5), "00:00:00");
+    }
+
+    fn ctx() -> FilenameContext {
+        FilenameContext {
+            job_id: "1234".into(),
+            array_job_id: "1200".into(),
+            array_task_id: "7".into(),
+            job_name: "train".into(),
+            user: "alice".into(),
+            first_node: "gpu001".into(),
+        }
+    }
+
+    #[test]
+    fn expand_slurm_filename_substitutes_every_pattern() {
+        let c = ctx();
+        assert_eq!(expand_slurm_filename("slurm-%j.out", &c), "slurm-1234.out");
+        assert_eq!(expand_slurm_filename("%x-%A_%a.log", &c), "train-1200_7.log");
+        assert_eq!(expand_slurm_filename("/home/%u/%N.%J", &c), "/home/alice/gpu001.1234");
+        assert_eq!(expand_slurm_filename("step-%s-%t-%n", &c), "step-batch-0-0");
+        assert_eq!(expand_slurm_filename("100%%", &c), "100%");
+    }
+
+    #[test]
+    fn expand_slurm_filename_pads_and_keeps_unknown() {
+        let c = ctx();
+        assert_eq!(expand_slurm_filename("%6j", &c), "001234");
+        assert_eq!(expand_slurm_filename("%3a", &c), "007");
+        assert_eq!(expand_slurm_filename("%q-%", &c), "%q-%");
+        // Missing context leaves the pattern for the user to see
+        let empty = FilenameContext::default();
+        assert_eq!(expand_slurm_filename("%x-%j", &empty), "%x-%j");
+    }
+
+    #[test]
+    fn expand_slurm_filename_non_array_uses_job_id_for_a() {
+        let c = FilenameContext { job_id: "55".into(), ..Default::default() };
+        assert_eq!(expand_slurm_filename("%A_%a", &c), "55_4294967294");
     }
 
     #[test]
